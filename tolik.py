@@ -1,5 +1,7 @@
 # ====================================================================
-# MCore Tolik - Version 2.0.0 (Все исправления, один файл)
+# MCore Tolik - Version 2.0.2 (Production Ready)
+# Исправления: асинхронный кэш хостов, вынос парсинга ссылок в AI-блок,
+# rate-limiting AI, отказ от orjson/lru_cache мифов
 # ====================================================================
 import os
 import re
@@ -30,8 +32,12 @@ from discord import app_commands
 # =========================================================================
 # КОНФИГУРАЦИЯ
 # =========================================================================
-BOT_VERSION = "2.0.0 (Fixed)"
+BOT_VERSION = "2.0.2 (Production)"
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+
+# Rate limiting для AI запросов (на уровне сервера)
+AI_RATE_LIMIT_WINDOW = 60  # секунд
+AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,7 +58,10 @@ MAX_PROMPT_CHARS = 2000
 AI_TIMEOUT_SECONDS = 20
 MAX_BODY_BYTES = 1_000_000
 LINK_REQUEST_TIMEOUT = 5
-BLOCKED_HOSTS = {"localhost", "metadata.google.internal"}
+BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "169.254.169.254"}
+
+# TTL кэша проверки хостов (секунд)
+HOST_CACHE_TTL = 300
 
 PERSONALITIES = {
     "buddy": "Ты — Толик, свой парень в компании. Ты мужчина. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения).",
@@ -112,6 +121,7 @@ def health():
 
 
 def run_flask():
+    # waitress — легковесный, идеален для health-check'ов. Gunicorn тут избыточен.
     serve(web_app, host='0.0.0.0', port=PORT, threads=4)
 
 
@@ -408,6 +418,25 @@ class AIHandler:
             logger.warning("⚠️ HF_TOKEN не задан — AI Handler недоступен")
 
         self.contexts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=5))
+        
+        # Rate limiting: {guild_id: deque(timestamps)}
+        self._rate_limits: Dict[int, deque] = defaultdict(lambda: deque(maxlen=AI_RATE_LIMIT_MAX_REQUESTS * 2))
+        self._rate_lock = asyncio.Lock()
+
+    def _check_rate_limit(self, guild_id: int) -> bool:
+        """Возвращает True, если лимит превышен."""
+        now = time.time()
+        window_start = now - AI_RATE_LIMIT_WINDOW
+        
+        # Чистим старые записи
+        while self._rate_limits[guild_id] and self._rate_limits[guild_id][0] < window_start:
+            self._rate_limits[guild_id].popleft()
+        
+        if len(self._rate_limits[guild_id]) >= AI_RATE_LIMIT_MAX_REQUESTS:
+            return True
+        
+        self._rate_limits[guild_id].append(now)
+        return False
 
     def is_mode_usable(self, mode: str, custom_prompt: str = "") -> bool:
         if mode == "local":
@@ -423,10 +452,18 @@ class AIHandler:
         channel_id: int,
         prompt: str,
         personality: str = "buddy",
-        custom_prompt: str = ""
+        custom_prompt: str = "",
+        guild_id: Optional[int] = None
     ) -> Optional[str]:
         if not self.available or not prompt.strip():
             return None
+
+        # Проверка rate limit (если передан guild_id)
+        if guild_id is not None:
+            async with self._rate_lock:
+                if self._check_rate_limit(guild_id):
+                    logger.warning(f"AI rate limit exceeded for guild {guild_id}")
+                    return None  # Молча пропускаем, бот фоллбекнется на Markov
 
         prompt = prompt[:MAX_PROMPT_CHARS]
 
@@ -451,18 +488,15 @@ class AIHandler:
         messages.append({"role": "user", "content": prompt})
 
         try:
-            loop = asyncio.get_event_loop()
-
-            def _call():
-                return self.client.chat_completion(
+            # asyncio.to_thread — современная альтернатива run_in_executor (Python 3.9+)
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.client.chat_completion,
                     model=MODEL_NAME,
                     messages=messages,
                     max_tokens=500,
                     temperature=0.7
-                )
-
-            response = await asyncio.wait_for(
-                loop.run_in_executor(None, _call),
+                ),
                 timeout=AI_TIMEOUT_SECONDS
             )
 
@@ -517,23 +551,54 @@ class VibeAnalyzer:
 
 
 # =========================================================================
-# ПАРСЕР ССЫЛОК (с защитой от SSRF и ограничением размера)
+# ПАРСЕР ССЫЛОК (с асинхронным кэшем безопасности хостов)
 # =========================================================================
-def _is_safe_host(hostname: str) -> bool:
+
+# Асинхронный кэш для проверки хостов (вместо опасного lru_cache)
+_host_safety_cache: Dict[str, tuple] = {}  # {hostname: (is_safe: bool, timestamp: float)}
+_host_cache_lock = asyncio.Lock()
+
+
+async def _is_safe_host_async(hostname: str) -> bool:
+    """Асинхронно-безопасная проверка хоста с кэшем."""
     if not hostname:
         return False
-    if hostname.lower() in BLOCKED_HOSTS:
+    
+    hostname_lower = hostname.lower()
+    if hostname_lower in BLOCKED_HOSTS:
         return False
-    try:
-        addr_info = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return False
-
-    for info in addr_info:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+    
+    now = time.time()
+    
+    # Проверяем кэш
+    async with _host_cache_lock:
+        if hostname_lower in _host_safety_cache:
+            cached_result, cached_time = _host_safety_cache[hostname_lower]
+            if now - cached_time < HOST_CACHE_TTL:
+                return cached_result
+    
+    # Тяжелая blocking операция — выполняем в потоке
+    loop = asyncio.get_event_loop()
+    
+    def _check():
+        try:
+            addr_info = socket.getaddrinfo(hostname, None)
+        except socket.gaierror:
             return False
-    return True
+
+        for info in addr_info:
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return False
+        return True
+    
+    is_safe = await loop.run_in_executor(None, _check)
+    
+    # Сохраняем в кэш
+    async with _host_cache_lock:
+        _host_safety_cache[hostname_lower] = (is_safe, now)
+    
+    return is_safe
 
 
 async def parse_link(url: str) -> Optional[str]:
@@ -541,7 +606,7 @@ async def parse_link(url: str) -> Optional[str]:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return None
-        if not _is_safe_host(parsed.hostname):
+        if not await _is_safe_host_async(parsed.hostname):
             logger.warning(f"Заблокирован небезопасный хост в ссылке: {parsed.hostname}")
             return None
 
@@ -676,7 +741,6 @@ class TolikBot(commands.Bot):
                 )
                 return
 
-            # ИСПРАВЛЕНО: раньше custom-режим не проверял доступность AI вообще
             if not self.ai.is_mode_usable(режим.value, settings.get("custom_prompt", "")):
                 await interaction.response.send_message(
                     "❌ AI режимы недоступны (не настроен HF_TOKEN на сервере бота)",
@@ -760,7 +824,6 @@ class TolikBot(commands.Bot):
         async def bot_promptclear(interaction: discord.Interaction):
             settings = await self.settings.get(interaction.guild.id)
             settings["custom_prompt"] = ""
-            # ИСПРАВЛЕНО: если активный режим был custom - сбрасываем на local
             if settings.get("mode") == "custom":
                 settings["mode"] = "local"
             await self.settings.save(interaction.guild.id)
@@ -799,7 +862,6 @@ class TolikBot(commands.Bot):
 
             embed.add_field(
                 name="🧠 IQ",
-                # ИСПРАВЛЕНО: раньше все диапазоны выдавали один и тот же эмодзи
                 value=f"**`{iq}`** — {iq_status(iq)}",
                 inline=False
             )
@@ -856,7 +918,10 @@ class TolikBot(commands.Bot):
 
             result = None
             if self.ai.is_mode_usable(mode, custom_prompt) and mode != "local":
-                result = await self.ai.generate(interaction.channel.id, ai_prompt, mode, custom_prompt)
+                result = await self.ai.generate(
+                    interaction.channel.id, ai_prompt, mode, custom_prompt,
+                    guild_id=interaction.guild.id
+                )
 
             if not result:
                 result = await fallback_fn()
@@ -1020,13 +1085,6 @@ class TolikBot(commands.Bot):
 
         clean = re.sub(r'<@!?\d+>', '', message.content).strip()
 
-        # ИСПРАВЛЕНО: ссылки комментируются независимо от режима
-        urls = re.findall(r'(https?://\S+)', message.content)
-        if urls:
-            link_info = await parse_link(urls[0])
-            if link_info:
-                clean = f"Пользователь скинул ссылку. {link_info}. Прокомментируй это. Сообщение: {clean}"
-
         should_reply = False
 
         if message.reference and message.reference.resolved:
@@ -1049,9 +1107,21 @@ class TolikBot(commands.Bot):
 
             response = None
 
+            # ИСПРАВЛЕНИЕ: Парсинг ссылок ТОЛЬКО для AI-режимов
             if self.ai.is_mode_usable(current_mode, custom_prompt) and current_mode != "local" and clean:
-                response = await self.ai.generate(message.channel.id, clean, current_mode, custom_prompt)
+                # Парсим ссылки только когда реально нужен AI
+                urls = re.findall(r'(https?://\S+)', message.content)
+                if urls:
+                    link_info = await parse_link(urls[0])
+                    if link_info:
+                        clean = f"Пользователь скинул ссылку. {link_info}. Прокомментируй это. Сообщение: {clean}"
+                
+                response = await self.ai.generate(
+                    message.channel.id, clean, current_mode, custom_prompt,
+                    guild_id=gid
+                )
 
+            # Фоллбек на Markov (без парсинга ссылок)
             if not response:
                 brain_stats = await self.brain.get_stats(gid)
                 if brain_stats['total_messages'] > 10:
