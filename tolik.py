@@ -1,7 +1,7 @@
 # ====================================================================
-# MCore Tolik - Version 2.0.2 (Production Ready)
-# Исправления: асинхронный кэш хостов, вынос парсинга ссылок в AI-блок,
-# rate-limiting AI, отказ от orjson/lru_cache мифов
+# MCore Tolik - Version 2.0.3 (Render Production Ready)
+# Исправления: self-ping, eviction памяти, graceful shutdown,
+# rate limit per user, O(n²) в парсере, + все фиксы из 2.0.2
 # ====================================================================
 import os
 import re
@@ -13,6 +13,7 @@ import socket
 import urllib.parse
 import time
 import logging
+import signal
 from threading import Thread
 from collections import defaultdict, deque, Counter
 from typing import Optional, Dict
@@ -32,12 +33,11 @@ from discord import app_commands
 # =========================================================================
 # КОНФИГУРАЦИЯ
 # =========================================================================
-BOT_VERSION = "2.0.2 (Production)"
+BOT_VERSION = "2.0.3 (Render Ready)"
 MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
 
-# Rate limiting для AI запросов (на уровне сервера)
 AI_RATE_LIMIT_WINDOW = 60  # секунд
-AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно
+AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно НА ПОЛЬЗОВАТЕЛЯ
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,8 +60,12 @@ MAX_BODY_BYTES = 1_000_000
 LINK_REQUEST_TIMEOUT = 5
 BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "169.254.169.254"}
 
-# TTL кэша проверки хостов (секунд)
 HOST_CACHE_TTL = 300
+MAX_CACHED_BRAINS = 50  # LRU eviction
+BRAIN_IDLE_TTL = 600    # 10 минут без использования — выгружаем
+AI_CONTEXT_MAXLEN = 12  # 6 диалогов
+AI_CONTEXT_CLEANUP_INTERVAL = 3600  # раз в час
+VIBE_CLEANUP_INTERVAL = 3600
 
 PERSONALITIES = {
     "buddy": "Ты - Толик. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
@@ -90,7 +94,9 @@ def validate_config():
         missing.append("MONGO_PASSWORD")
     if missing:
         logger.critical(f"❌ Не заданы обязательные переменные окружения: {', '.join(missing)}")
-        sys.exit(1)
+        # Не sys.exit(1)! Бесконечное ожидание вместо рестарт-лупа
+        while True:
+            time.sleep(60)
     if not HF_TOKEN:
         logger.warning("⚠️ HF_TOKEN не задан — AI-режимы будут недоступны, бот будет работать только локально")
 
@@ -121,7 +127,6 @@ def health():
 
 
 def run_flask():
-    # waitress — легковесный, идеален для health-check'ов. Gunicorn тут избыточен.
     serve(web_app, host='0.0.0.0', port=PORT, threads=4)
 
 
@@ -189,13 +194,14 @@ class SettingsManager:
 
 
 # =========================================================================
-# ЛОКАЛЬНЫЙ МОЗГ (MARKOV)
+# ЛОКАЛЬНЫЙ МОЗГ (MARKOV) — с LRU eviction
 # =========================================================================
 class MarkovBrain:
 
     def __init__(self, db):
         self.db = db
         self.brains: Dict[int, Dict] = {}
+        self._brain_last_used: Dict[int, float] = {}
         self._save_locks: Dict[int, asyncio.Lock] = {}
         self._load_locks: Dict[int, asyncio.Lock] = {}
 
@@ -220,19 +226,42 @@ class MarkovBrain:
             container.append(value)
 
     async def _load(self, gid: int) -> Dict:
+        now = time.time()
+
+        # Чистим просроченные
+        expired = [g for g, t in self._brain_last_used.items() if now - t > BRAIN_IDLE_TTL]
+        for g in expired:
+            if g in self.brains:
+                await self._save(g)
+                del self.brains[g]
+            self._brain_last_used.pop(g, None)
+
+        # LRU eviction если перебор кэша
+        if len(self.brains) >= MAX_CACHED_BRAINS and gid not in self.brains:
+            oldest = min(self._brain_last_used, key=self._brain_last_used.get)
+            await self._save(oldest)
+            del self.brains[oldest]
+            self._brain_last_used.pop(oldest, None)
+            logger.info(f"Мозг сервера {oldest} выгружен (LRU)")
+
         if gid in self.brains:
+            self._brain_last_used[gid] = now
             return self.brains[gid]
 
         lock = self._get_lock(self._load_locks, gid)
         async with lock:
             if gid in self.brains:
+                self._brain_last_used[gid] = now
                 return self.brains[gid]
 
             try:
                 doc = await self.db.find_one({"_id": f"brain_{gid}"})
             except Exception as e:
-                logger.error(f"Ошибка загрузки мозга {gid} (БД недоступна): {e}")
-                return self._new_brain()
+                logger.error(f"Ошибка загрузки мозга {gid}: {e}")
+                brain = self._new_brain()
+                self.brains[gid] = brain
+                self._brain_last_used[gid] = now
+                return brain
 
             brain = self._new_brain()
             if doc:
@@ -247,6 +276,7 @@ class MarkovBrain:
                 logger.info(f"Мозг сервера {gid} загружен ({brain['total_messages']} сообщений)")
 
             self.brains[gid] = brain
+            self._brain_last_used[gid] = now
             return brain
 
     async def _save(self, gid: int):
@@ -286,9 +316,15 @@ class MarkovBrain:
     async def learn(self, message: discord.Message, gid: int):
         brain = await self._load(gid)
 
-        tokens = self._tokenize(message.content) if message.content else []
-        for att in message.attachments:
-            tokens.append(att.url)
+        # Не учим команды
+        content = message.content or ""
+        if content.startswith('/'):
+            return
+
+        tokens = self._tokenize(content)
+        # Вложения заменяем на плейсхолдер, а не URL
+        if message.attachments:
+            tokens.append("[attachment]")
 
         if not tokens:
             return
@@ -392,14 +428,21 @@ class MarkovBrain:
 
     async def clear(self, gid: int):
         self.brains[gid] = self._new_brain()
+        self._brain_last_used.pop(gid, None)
         try:
             await self.db.delete_one({"_id": f"brain_{gid}"})
         except Exception as e:
             logger.error(f"Ошибка очистки мозга {gid} в БД: {e}")
 
+    async def save_all(self):
+        """Аварийное сохранение всех мозгов при shutdown."""
+        for gid in list(self.brains.keys()):
+            await self._save(gid)
+        logger.info("Все мозги сохранены")
+
 
 # =========================================================================
-# AI ИНТЕГРАЦИЯ
+# AI ИНТЕГРАЦИЯ — с per-user rate limit и очисткой контекста
 # =========================================================================
 class AIHandler:
 
@@ -417,26 +460,39 @@ class AIHandler:
         else:
             logger.warning("⚠️ HF_TOKEN не задан — AI Handler недоступен")
 
-        self.contexts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=5))
-        
-        # Rate limiting: {guild_id: deque(timestamps)}
-        self._rate_limits: Dict[int, deque] = defaultdict(lambda: deque(maxlen=AI_RATE_LIMIT_MAX_REQUESTS * 2))
+        self.contexts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=AI_CONTEXT_MAXLEN))
+        self._context_last_used: Dict[int, float] = {}
+
+        # Rate limiting per (guild_id, user_id)
+        self._rate_limits: Dict[tuple, deque] = defaultdict(lambda: deque(maxlen=AI_RATE_LIMIT_MAX_REQUESTS * 2))
         self._rate_lock = asyncio.Lock()
 
-    def _check_rate_limit(self, guild_id: int) -> bool:
-        """Возвращает True, если лимит превышен."""
+    def _check_rate_limit(self, guild_id: int, user_id: int) -> bool:
+        """Возвращает True, если лимит превышен для этого пользователя."""
         now = time.time()
         window_start = now - AI_RATE_LIMIT_WINDOW
-        
-        # Чистим старые записи
-        while self._rate_limits[guild_id] and self._rate_limits[guild_id][0] < window_start:
-            self._rate_limits[guild_id].popleft()
-        
-        if len(self._rate_limits[guild_id]) >= AI_RATE_LIMIT_MAX_REQUESTS:
+        key = (guild_id, user_id)
+
+        while self._rate_limits[key] and self._rate_limits[key][0] < window_start:
+            self._rate_limits[key].popleft()
+
+        if len(self._rate_limits[key]) >= AI_RATE_LIMIT_MAX_REQUESTS:
             return True
-        
-        self._rate_limits[guild_id].append(now)
+
+        self._rate_limits[key].append(now)
         return False
+
+    async def _cleanup_contexts(self):
+        """Периодическая очистка неактивных контекстов."""
+        while True:
+            await asyncio.sleep(AI_CONTEXT_CLEANUP_INTERVAL)
+            now = time.time()
+            dead = [ch for ch, t in self._context_last_used.items() if now - t > AI_CONTEXT_CLEANUP_INTERVAL]
+            for ch in dead:
+                self.contexts.pop(ch, None)
+                self._context_last_used.pop(ch, None)
+            if dead:
+                logger.info(f"Очищено {len(dead)} неактивных AI-контекстов")
 
     def is_mode_usable(self, mode: str, custom_prompt: str = "") -> bool:
         if mode == "local":
@@ -453,17 +509,18 @@ class AIHandler:
         prompt: str,
         personality: str = "buddy",
         custom_prompt: str = "",
-        guild_id: Optional[int] = None
+        guild_id: Optional[int] = None,
+        user_id: Optional[int] = None
     ) -> Optional[str]:
         if not self.available or not prompt.strip():
             return None
 
-        # Проверка rate limit (если передан guild_id)
-        if guild_id is not None:
+        # Rate limit per user
+        if guild_id is not None and user_id is not None:
             async with self._rate_lock:
-                if self._check_rate_limit(guild_id):
-                    logger.warning(f"AI rate limit exceeded for guild {guild_id}")
-                    return None  # Молча пропускаем, бот фоллбекнется на Markov
+                if self._check_rate_limit(guild_id, user_id):
+                    logger.warning(f"AI rate limit exceeded for user {user_id} in guild {guild_id}")
+                    return None
 
         prompt = prompt[:MAX_PROMPT_CHARS]
 
@@ -488,7 +545,6 @@ class AIHandler:
         messages.append({"role": "user", "content": prompt})
 
         try:
-            # asyncio.to_thread — современная альтернатива run_in_executor (Python 3.9+)
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     self.client.chat_completion,
@@ -504,6 +560,7 @@ class AIHandler:
                 answer = response.choices[0].message.content
                 self.contexts[channel_id].append(f"Юзер: {prompt[:200]}")
                 self.contexts[channel_id].append(f"Толик: {answer[:200]}")
+                self._context_last_used[channel_id] = time.time()
                 return answer
 
             return None
@@ -517,13 +574,23 @@ class AIHandler:
 
 
 # =========================================================================
-# АНАЛИЗАТОР ВАЙБА
+# АНАЛИЗАТОР ВАЙБА — с периодической очисткой
 # =========================================================================
 class VibeAnalyzer:
     def __init__(self):
         self.stats: Dict[int, Dict] = defaultdict(
             lambda: {"msg": 0, "caps": 0, "last": time.time()}
         )
+
+    async def _cleanup_loop(self):
+        while True:
+            await asyncio.sleep(VIBE_CLEANUP_INTERVAL)
+            now = time.time()
+            dead = [k for k, v in self.stats.items() if now - v["last"] > VIBE_CLEANUP_INTERVAL]
+            for k in dead:
+                del self.stats[k]
+            if dead:
+                logger.debug(f"Очищено {len(dead)} неактивных записей VibeAnalyzer")
 
     def analyze(self, message: discord.Message) -> Optional[str]:
         now = time.time()
@@ -551,35 +618,47 @@ class VibeAnalyzer:
 
 
 # =========================================================================
-# ПАРСЕР ССЫЛОК (с асинхронным кэшем безопасности хостов)
+# ПАРСЕР ССЫЛОК (с асинхронным кэшем и bytearray)
 # =========================================================================
 
-# Асинхронный кэш для проверки хостов (вместо опасного lru_cache)
-_host_safety_cache: Dict[str, tuple] = {}  # {hostname: (is_safe: bool, timestamp: float)}
+_host_safety_cache: Dict[str, tuple] = {}
 _host_cache_lock = asyncio.Lock()
+_host_cache_last_cleanup = time.time()
+
+
+async def _cleanup_host_cache_if_needed():
+    global _host_cache_last_cleanup
+    now = time.time()
+    if now - _host_cache_last_cleanup < 3600:
+        return
+    _host_cache_last_cleanup = now
+    async with _host_cache_lock:
+        expired = [h for h, (_, t) in _host_safety_cache.items() if now - t > HOST_CACHE_TTL * 2]
+        for h in expired:
+            del _host_safety_cache[h]
+        if expired:
+            logger.debug(f"Очищено {len(expired)} записей кэша хостов")
 
 
 async def _is_safe_host_async(hostname: str) -> bool:
     """Асинхронно-безопасная проверка хоста с кэшем."""
     if not hostname:
         return False
-    
+
     hostname_lower = hostname.lower()
     if hostname_lower in BLOCKED_HOSTS:
         return False
-    
+
     now = time.time()
-    
-    # Проверяем кэш
+
     async with _host_cache_lock:
         if hostname_lower in _host_safety_cache:
             cached_result, cached_time = _host_safety_cache[hostname_lower]
             if now - cached_time < HOST_CACHE_TTL:
                 return cached_result
-    
-    # Тяжелая blocking операция — выполняем в потоке
+
     loop = asyncio.get_event_loop()
-    
+
     def _check():
         try:
             addr_info = socket.getaddrinfo(hostname, None)
@@ -591,13 +670,13 @@ async def _is_safe_host_async(hostname: str) -> bool:
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
                 return False
         return True
-    
+
     is_safe = await loop.run_in_executor(None, _check)
-    
-    # Сохраняем в кэш
+
     async with _host_cache_lock:
         _host_safety_cache[hostname_lower] = (is_safe, now)
-    
+
+    await _cleanup_host_cache_if_needed()
     return is_safe
 
 
@@ -624,13 +703,14 @@ async def parse_link(url: str) -> Optional[str]:
                 if content_length and int(content_length) > MAX_BODY_BYTES:
                     return None
 
-                raw = b""
+                # bytearray вместо bytes += chunk
+                raw = bytearray()
                 async for chunk in resp.content.iter_chunked(8192):
-                    raw += chunk
+                    raw.extend(chunk)
                     if len(raw) > MAX_BODY_BYTES:
                         break
 
-                html = raw.decode(errors="ignore")
+                html = bytes(raw).decode(errors="ignore")
                 soup = BeautifulSoup(html, 'html.parser')
 
                 title = soup.title.string.strip() if soup.title and soup.title.string else ""
@@ -652,15 +732,15 @@ async def parse_link(url: str) -> Optional[str]:
 
 def iq_status(iq: int) -> str:
     if iq < 60:
-        return "🤡"
+        return ":clown:"
     elif iq < 80:
-        return "😐"
+        return ":neutral_face:"
     elif iq < 100:
-        return "🙂"
+        return ":slight_smile:"
     elif iq < 130:
-        return "🧠"
+        return ":brain:"
     else:
-        return "🔥"
+        return ":fire:"
 
 
 # =========================================================================
@@ -685,8 +765,10 @@ class TolikBot(commands.Bot):
         self.brain: Optional[MarkovBrain] = None
         self.ai: Optional[AIHandler] = None
         self.vibe: Optional[VibeAnalyzer] = None
+        self._keep_alive_task = None
 
     async def setup_hook(self):
+        # Подключение к MongoDB
         try:
             self.mongo_client = AsyncIOMotorClient(
                 build_mongo_uri(),
@@ -698,7 +780,9 @@ class TolikBot(commands.Bot):
             logger.info("✅ MongoDB подключена")
         except Exception as e:
             logger.critical(f"❌ Ошибка MongoDB: {e}")
-            sys.exit(1)
+            # Не sys.exit(1) — бесконечное ожидание
+            while True:
+                await asyncio.sleep(60)
 
         db = self.mongo_client[MONGO_DB_NAME]
 
@@ -706,6 +790,15 @@ class TolikBot(commands.Bot):
         self.brain = MarkovBrain(db["brain"])
         self.ai = AIHandler()
         self.vibe = VibeAnalyzer()
+
+        # Запуск фоновых задач
+        self._keep_alive_task = asyncio.create_task(self._keep_alive_loop())
+        asyncio.create_task(self.ai._cleanup_contexts())
+        asyncio.create_task(self.vibe._cleanup_loop())
+
+        # Graceful shutdown
+        signal.signal(signal.SIGTERM, lambda sig, frame: asyncio.create_task(self._emergency_save()))
+        signal.signal(signal.SIGINT, lambda sig, frame: asyncio.create_task(self._emergency_save()))
 
         self._register_commands()
 
@@ -715,20 +808,41 @@ class TolikBot(commands.Bot):
         except Exception as e:
             logger.error(f"❌ Ошибка синхронизации: {e}")
 
+    async def _keep_alive_loop(self):
+        """Self-ping чтобы Render не усыплял бота."""
+        await asyncio.sleep(30)
+        while True:
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(f"http://localhost:{PORT}/health", timeout=5):
+                        pass
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+
+    async def _emergency_save(self):
+        """Аварийное сохранение при SIGTERM/SIGINT."""
+        logger.info("⚠️ Получен сигнал завершения, сохраняю мозги...")
+        if self.brain:
+            await self.brain.save_all()
+        if self.mongo_client:
+            self.mongo_client.close()
+        logger.info("✅ Сохранение завершено")
+
     def _register_commands(self):
         """Регистрация всех команд."""
 
         # ========== ГРУППА BOT ==========
-        bot_group = app_commands.Group(name="bot", description="⚙️ Управление ботом")
+        bot_group = app_commands.Group(name="bot", description="Управление ботом")
 
-        @bot_group.command(name="mode", description="🎭 Режим личности")
+        @bot_group.command(name="mode", description="Режим личности")
         @app_commands.choices(режим=[
             app_commands.Choice(name="Локальный", value="local"),
             app_commands.Choice(name="Брат", value="buddy"),
             app_commands.Choice(name="Агрессивный", value="aggressive"),
             app_commands.Choice(name="Дружелюбный", value="friendly"),
             app_commands.Choice(name="Мудрец", value="wise"),
-            app_commands.Choice(name="⭐ Пользовательский", value="custom")
+            app_commands.Choice(name="Пользовательский", value="custom")
         ])
         @app_commands.default_permissions(administrator=True)
         async def bot_mode(interaction: discord.Interaction, режим: app_commands.Choice[str]):
@@ -756,13 +870,13 @@ class TolikBot(commands.Bot):
                 ephemeral=True
             )
 
-        @bot_group.command(name="clear", description="🗑️ Очистить память бота")
+        @bot_group.command(name="clear", description="Очистить память бота")
         @app_commands.default_permissions(administrator=True)
         async def bot_clear(interaction: discord.Interaction):
             await self.brain.clear(interaction.guild.id)
-            await interaction.response.send_message("♻️ Память очищена!", ephemeral=True)
+            await interaction.response.send_message("Память очищена!", ephemeral=True)
 
-        @bot_group.command(name="working", description="💬 Авто-флуд вкл/выкл")
+        @bot_group.command(name="working", description="Авто-флуд вкл/выкл")
         @app_commands.default_permissions(administrator=True)
         async def bot_working(interaction: discord.Interaction, состояние: bool):
             settings = await self.settings.get(interaction.guild.id)
@@ -770,11 +884,11 @@ class TolikBot(commands.Bot):
             await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                f"💬 Авто-флуд: {'🟢 включен' if состояние else '🔴 выключен'}",
+                f"Авто-флуд: {'🟢 включен' if состояние else '🔴 выключен'}",
                 ephemeral=True
             )
 
-        @bot_group.command(name="prompt", description="✏️ Установить кастомный промпт")
+        @bot_group.command(name="prompt", description="Установить кастомный промпт")
         @app_commands.default_permissions(administrator=True)
         async def bot_prompt(interaction: discord.Interaction, промпт: str):
             if len(промпт) > 1500:
@@ -789,16 +903,16 @@ class TolikBot(commands.Bot):
             await self.settings.save(interaction.guild.id)
 
             emb = discord.Embed(
-                title="✏️ Кастомный промпт установлен",
+                title="Кастомный промпт установлен",
                 description=f"```\n{промпт[:1000]}{'...' if len(промпт) > 1000 else ''}\n```",
                 color=0x00BFFF,
                 timestamp=discord.utils.utcnow()
             )
-            emb.set_footer(text="Используй /bot mode → ⭐ Пользовательский для активации")
+            emb.set_footer(text="Используй /bot mode → Пользовательский для активации")
 
             await interaction.response.send_message(embed=emb, ephemeral=True)
 
-        @bot_group.command(name="promptshow", description="👁️ Показать кастомный промпт")
+        @bot_group.command(name="promptshow", description="Показать кастомный промпт")
         async def bot_promptshow(interaction: discord.Interaction):
             settings = await self.settings.get(interaction.guild.id)
             prompt = settings.get("custom_prompt", "")
@@ -811,7 +925,7 @@ class TolikBot(commands.Bot):
                 return
 
             emb = discord.Embed(
-                title="✏️ Текущий кастомный промпт",
+                title="Текущий кастомный промпт",
                 description=f"```\n{prompt[:4000]}\n```",
                 color=0x00BFFF,
                 timestamp=discord.utils.utcnow()
@@ -819,7 +933,7 @@ class TolikBot(commands.Bot):
 
             await interaction.response.send_message(embed=emb, ephemeral=True)
 
-        @bot_group.command(name="promptclear", description="🗑️ Удалить кастомный промпт")
+        @bot_group.command(name="promptclear", description="Удалить кастомный промпт")
         @app_commands.default_permissions(administrator=True)
         async def bot_promptclear(interaction: discord.Interaction):
             settings = await self.settings.get(interaction.guild.id)
@@ -829,16 +943,16 @@ class TolikBot(commands.Bot):
             await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                "🗑️ Кастомный промпт удалён!",
+                "Кастомный промпт удалён!",
                 ephemeral=True
             )
 
         self.tree.add_command(bot_group)
 
         # ========== ГРУППА INFO ==========
-        info_group = app_commands.Group(name="info", description="ℹ️ Информация")
+        info_group = app_commands.Group(name="info", description="Информация")
 
-        @info_group.command(name="bot", description="📊 Статистика и IQ бота")
+        @info_group.command(name="bot", description="Статистика и IQ бота")
         async def info_bot(interaction: discord.Interaction):
             await interaction.response.defer()
 
@@ -849,7 +963,7 @@ class TolikBot(commands.Bot):
             iq = stats['iq']
 
             embed = discord.Embed(
-                title="ℹ️ Информация",
+                title="Информация",
                 color=0x00BFFF,
                 timestamp=discord.utils.utcnow()
             )
@@ -861,13 +975,13 @@ class TolikBot(commands.Bot):
             )
 
             embed.add_field(
-                name="🧠 IQ",
+                name="IQ",
                 value=f"**`{iq}`** — {iq_status(iq)}",
                 inline=False
             )
 
             embed.add_field(
-                name="📊 Статистика мозга",
+                name="Статистика мозга",
                 value=(
                     f"Сообщений изучено: `{stats['total_messages']}`\n"
                     f"Слов в словаре: `{stats['total_words']}`\n"
@@ -882,13 +996,13 @@ class TolikBot(commands.Bot):
                     f"{i}. **{w}** — `{c}` раз"
                     for i, (w, c) in enumerate(stats['top_words'], 1)
                 ])
-                embed.add_field(name="🗣️ Топ слов", value=top, inline=False)
+                embed.add_field(name="Топ слов", value=top, inline=False)
 
             channels = settings.get("allowed_channels", [])
-            channels_text = "🌐 Везде" if not channels else ", ".join([f"<#{c}>" for c in channels])
+            channels_text = "Везде" if not channels else ", ".join([f"<#{c}>" for c in channels])
 
             embed.add_field(
-                name="⚙️ Настройки",
+                name="Настройки",
                 value=(
                     f"Авто-флуд: `{'🟢' if settings['ai_chat'] else '🔴'}`\n"
                     f"Шанс ответа: `{int(settings['chat_chance'] * 100)}%`\n"
@@ -908,7 +1022,7 @@ class TolikBot(commands.Bot):
         self.tree.add_command(info_group)
 
         # ========== ГРУППА GENERATE ==========
-        gen_group = app_commands.Group(name="generate", description="🎲 Генерация контента")
+        gen_group = app_commands.Group(name="generate", description="Генерация контента")
 
         async def _generate_and_reply(interaction, ai_prompt, fallback_fn, embed_title):
             await interaction.response.defer()
@@ -920,7 +1034,8 @@ class TolikBot(commands.Bot):
             if self.ai.is_mode_usable(mode, custom_prompt) and mode != "local":
                 result = await self.ai.generate(
                     interaction.channel.id, ai_prompt, mode, custom_prompt,
-                    guild_id=interaction.guild.id
+                    guild_id=interaction.guild.id,
+                    user_id=interaction.user.id
                 )
 
             if not result:
@@ -936,44 +1051,44 @@ class TolikBot(commands.Bot):
 
             await interaction.followup.send(embed=emb)
 
-        @gen_group.command(name="anecdote", description="🤣 Сгенерировать анекдот")
+        @gen_group.command(name="anecdote", description="Сгенерировать анекдот")
         async def gen_anecdote(interaction: discord.Interaction):
             async def fallback():
                 p1 = await self.brain.generate_text(interaction.guild.id, length=random.randint(4, 7))
                 p2 = await self.brain.generate_text(interaction.guild.id, length=random.randint(5, 9))
-                return f"— {p1.capitalize()}?\n— {p2.capitalize()}! 😂"
+                return f"— {p1.capitalize()}?\n— {p2.capitalize()}!"
 
-            await _generate_and_reply(interaction, "Расскажи смешной анекдот.", fallback, "🤣 Свежий анекдот")
+            await _generate_and_reply(interaction, "Расскажи смешной анекдот.", fallback, "Свежий анекдот")
 
-        @gen_group.command(name="dialogue", description="💬 Сгенерировать диалог")
+        @gen_group.command(name="dialogue", description="Сгенерировать диалог")
         async def gen_dialogue(interaction: discord.Interaction):
             async def fallback():
                 p1 = await self.brain.generate_text(interaction.guild.id, length=6)
                 p2 = await self.brain.generate_text(interaction.guild.id, length=7)
                 return f"**— {p1.capitalize()}**\n**— {p2.capitalize()}**"
 
-            await _generate_and_reply(interaction, "Придумай короткий диалог.", fallback, "💬 Случайный диалог")
+            await _generate_and_reply(interaction, "Придумай короткий диалог.", fallback, "Случайный диалог")
 
-        @gen_group.command(name="quote", description="📜 Сгенерировать цитату")
+        @gen_group.command(name="quote", description="Сгенерировать цитату")
         async def gen_quote(interaction: discord.Interaction):
             async def fallback():
                 text = await self.brain.generate_text(interaction.guild.id, length=9)
                 return f"*\"{text}\"*"
 
-            await _generate_and_reply(interaction, "Придумай мудрую цитату.", fallback, "📜 Цитата великих людей")
+            await _generate_and_reply(interaction, "Придумай мудрую цитату.", fallback, "Цитата великих людей")
 
-        @gen_group.command(name="story", description="📖 Сгенерировать историю")
+        @gen_group.command(name="story", description="Сгенерировать историю")
         async def gen_story(interaction: discord.Interaction):
             async def fallback():
                 text = await self.brain.generate_text(interaction.guild.id, length=25)
                 return text.capitalize() + "."
 
-            await _generate_and_reply(interaction, "Напиши короткую историю.", fallback, "📖 Короткая история")
+            await _generate_and_reply(interaction, "Напиши короткую историю.", fallback, "Короткая история")
 
         self.tree.add_command(gen_group)
 
         # ========== КОМАНДЫ КАНАЛОВ ==========
-        @self.tree.command(name="addchannel", description="📍 Добавить канал для авто-флуда")
+        @self.tree.command(name="addchannel", description="Добавить канал для авто-флуда")
         @app_commands.default_permissions(administrator=True)
         async def add_channel(interaction: discord.Interaction, канал: discord.TextChannel):
             settings = await self.settings.get(interaction.guild.id)
@@ -986,7 +1101,7 @@ class TolikBot(commands.Bot):
                 ephemeral=True
             )
 
-        @self.tree.command(name="removechannel", description="📍 Убрать канал из авто-флуда")
+        @self.tree.command(name="removechannel", description="Убрать канал из авто-флуда")
         @app_commands.default_permissions(administrator=True)
         async def remove_channel(interaction: discord.Interaction, канал: discord.TextChannel):
             settings = await self.settings.get(interaction.guild.id)
@@ -999,7 +1114,7 @@ class TolikBot(commands.Bot):
                 ephemeral=True
             )
 
-        @self.tree.command(name="clearchannels", description="🔄 Сбросить ограничения каналов")
+        @self.tree.command(name="clearchannels", description="Сбросить ограничения каналов")
         @app_commands.default_permissions(administrator=True)
         async def clear_channels(interaction: discord.Interaction):
             settings = await self.settings.get(interaction.guild.id)
@@ -1007,11 +1122,11 @@ class TolikBot(commands.Bot):
             await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                "🔄 Бот будет отвечать во всех каналах!",
+                "Бот будет отвечать во всех каналах!",
                 ephemeral=True
             )
 
-        @self.tree.command(name="setchance", description="🎯 Установить шанс авто-ответа")
+        @self.tree.command(name="setchance", description="Установить шанс авто-ответа")
         @app_commands.default_permissions(administrator=True)
         async def set_chance(
             interaction: discord.Interaction,
@@ -1022,23 +1137,23 @@ class TolikBot(commands.Bot):
             await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                f"🎲 Шанс авто-ответа: **{процент}%**",
+                f"Шанс авто-ответа: **{процент}%**",
                 ephemeral=True
             )
 
-        @self.tree.command(name="topwords", description="🗣️ Топ-10 слов в лексиконе")
+        @self.tree.command(name="topwords", description="Топ-10 слов в лексиконе")
         async def top_words(interaction: discord.Interaction):
             stats = await self.brain.get_stats(interaction.guild.id)
 
             if not stats['top_words']:
                 await interaction.response.send_message(
-                    "🤷 Память пуста!",
+                    "Память пуста!",
                     ephemeral=True
                 )
                 return
 
             embed = discord.Embed(
-                title="🗣️ Лексикон сервера",
+                title="Лексикон сервера",
                 color=0x00BFFF
             )
 
@@ -1107,21 +1222,19 @@ class TolikBot(commands.Bot):
 
             response = None
 
-            # ИСПРАВЛЕНИЕ: Парсинг ссылок ТОЛЬКО для AI-режимов
             if self.ai.is_mode_usable(current_mode, custom_prompt) and current_mode != "local" and clean:
-                # Парсим ссылки только когда реально нужен AI
                 urls = re.findall(r'(https?://\S+)', message.content)
                 if urls:
                     link_info = await parse_link(urls[0])
                     if link_info:
                         clean = f"Пользователь скинул ссылку. {link_info}. Прокомментируй это. Сообщение: {clean}"
-                
+
                 response = await self.ai.generate(
                     message.channel.id, clean, current_mode, custom_prompt,
-                    guild_id=gid
+                    guild_id=gid,
+                    user_id=message.author.id
                 )
 
-            # Фоллбек на Markov (без парсинга ссылок)
             if not response:
                 brain_stats = await self.brain.get_stats(gid)
                 if brain_stats['total_messages'] > 10:
@@ -1145,6 +1258,12 @@ class TolikBot(commands.Bot):
     async def close(self):
         logger.info("Завершение работы...")
 
+        if self._keep_alive_task:
+            self._keep_alive_task.cancel()
+
+        if self.brain:
+            await self.brain.save_all()
+
         if self.mongo_client:
             self.mongo_client.close()
 
@@ -1160,7 +1279,7 @@ def main():
 
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info("🌐 Веб-сервер запущен")
+    logger.info("Веб-сервер запущен")
 
     bot = TolikBot()
 
