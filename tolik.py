@@ -24,8 +24,7 @@ from waitress import serve
 # КОНФИГ И НАСТРОЙКИ
 # ==============================================================================
 BOT_VERSION = "2.1.0 (Human Refactored)"
-# V4-Flash не существует, поправил на актуальную быструю модель
-MODEL_NAME = "deepseek-ai/DeepSeek-V3" 
+MODEL_NAME = "deepseek-ai/DeepSeek-V4.1-Flash" 
 
 # Render на бесплатном тарифе убивает инстанс через 15 мин бездействия. 
 # Этот костыль с self-ping'ом держит его в тонусе.
