@@ -34,7 +34,7 @@ from discord import app_commands
 # КОНФИГУРАЦИЯ
 # =========================================================================
 BOT_VERSION = "2.0.4"
-MODEL_NAME = "HuggingFaceH4/zephyr-7b-beta"
+MODEL_NAME = "baidu/Unlimited-OCR"
 
 AI_RATE_LIMIT_WINDOW = 60  # секунд
 AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно НА ПОЛЬЗОВАТЕЛЯ
