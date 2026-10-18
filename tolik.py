@@ -34,7 +34,7 @@ from discord import app_commands
 # КОНФИГУРАЦИЯ
 # =========================================================================
 BOT_VERSION = "2.0.3 (Render Ready)"
-MODEL_NAME = "deepseek-ai/DeepSeek-V4-Flash"
+MODEL_NAME = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
 
 AI_RATE_LIMIT_WINDOW = 60  # секунд
 AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно НА ПОЛЬЗОВАТЕЛЯ
