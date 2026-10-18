@@ -33,8 +33,8 @@ from discord import app_commands
 # =========================================================================
 # КОНФИГУРАЦИЯ
 # =========================================================================
-BOT_VERSION = "2.0.3 (Render Ready)"
-MODEL_NAME = "openbmb/MiniCPM-V-4.7-35B-A3B"
+BOT_VERSION = "2.0.4"
+MODEL_NAME = "Qwen/Qwen3.8-Flash-Next"
 
 AI_RATE_LIMIT_WINDOW = 60  # секунд
 AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно НА ПОЛЬЗОВАТЕЛЯ
