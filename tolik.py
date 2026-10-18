@@ -34,7 +34,7 @@ from discord import app_commands
 # КОНФИГУРАЦИЯ
 # =========================================================================
 BOT_VERSION = "2.0.3 (Render Ready)"
-MODEL_NAME = "google/embeddinggemma-2"
+MODEL_NAME = "jialinyyzz/humanizer"
 
 AI_RATE_LIMIT_WINDOW = 60  # секунд
 AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно НА ПОЛЬЗОВАТЕЛЯ
