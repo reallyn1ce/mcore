@@ -1,7 +1,6 @@
-discord.py>=2.3.0
-motor>=3.3.0
-aiohttp>=3.9.0
-beautifulsoup4>=4.12.0
-huggingface_hub>=0.20.0
-flask>=3.0.0
-waitress>=2.1.0
+discord.py
+motor
+aiohttp
+beautifulsoup4
+flask
+waitress
