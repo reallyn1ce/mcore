@@ -1,7 +1,5 @@
 # ====================================================================
-# MCore Tolik - Version 2.0.3 (Render Production Ready)
-# Исправления: self-ping, eviction памяти, graceful shutdown,
-# rate limit per user, O(n²) в парсере, + все фиксы из 2.0.2
+# MCore - Version 2.0.4 (Render Production Ready)
 # ====================================================================
 import os
 import re
@@ -34,19 +32,19 @@ from discord import app_commands
 # КОНФИГУРАЦИЯ
 # =========================================================================
 BOT_VERSION = "2.0.4"
-MODEL_NAME = "baidu/Unlimited-OCR"
+MODEL_NAME = os.environ.get("HF_MODEL", "openai/gpt-oss-120b")
 
 AI_RATE_LIMIT_WINDOW = 60  # секунд
-AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно НА ПОЛЬЗОВАТЕЛЯ
+AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно на пользователя
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("MCoreTolik")
+logger = logging.getLogger("MCore")
 
-TOLIK_TOKEN = os.environ.get("TOLIK_TOKEN")
+MCORE_TOKEN = os.environ.get("MCORE_TOKEN")
 HF_TOKEN = os.environ.get("HF_TOKEN")
 MONGO_USER = os.environ.get("MONGO_USER")
 MONGO_PASSWORD = os.environ.get("MONGO_PASSWORD")
@@ -62,16 +60,15 @@ BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "169.254.169.254"}
 
 HOST_CACHE_TTL = 300
 MAX_CACHED_BRAINS = 50  # LRU eviction
-BRAIN_IDLE_TTL = 600    # 10 минут без использования — выгружаем
+BRAIN_IDLE_TTL = 600    # 10 минут без использования - выгружаем
 AI_CONTEXT_MAXLEN = 12  # 6 диалогов
-AI_CONTEXT_CLEANUP_INTERVAL = 3600  # раз в час
-VIBE_CLEANUP_INTERVAL = 3600
+CLEANUP_INTERVAL = 3600  # раз в час
 
 PERSONALITIES = {
-    "buddy": "Ты - Толик. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
-    "aggressive": "Ты - Толик. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Отвечай агрессией на агрессию. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)",
-    "friendly": "Ты - Толик. Отвечай добротой на доброту. Отвечай с эмодзи. Говори о себе в мужском роде. отвечай кратко. (1-3 предложения)",
-    "wise": "Ты - Толик. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)."
+    "buddy": "Ты - MCore. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
+    "aggressive": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Отвечай агрессией на агрессию. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)",
+    "friendly": "Ты - MCore. Отвечай добротой на доброту. Говори о себе в мужском роде. Отвечай кратко. (1-3 предложения)",
+    "wise": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)."
 }
 
 MODE_NAMES = {
@@ -86,19 +83,19 @@ MODE_NAMES = {
 
 def validate_config():
     missing = []
-    if not TOLIK_TOKEN:
-        missing.append("TOLIK_TOKEN")
+    if not MCORE_TOKEN:
+        missing.append("MCORE_TOKEN")
     if not MONGO_USER:
         missing.append("MONGO_USER")
     if not MONGO_PASSWORD:
         missing.append("MONGO_PASSWORD")
     if missing:
-        logger.critical(f"❌ Не заданы обязательные переменные окружения: {', '.join(missing)}")
-        # Не sys.exit(1)! Бесконечное ожидание вместо рестарт-лупа
+        logger.critical(f"Не заданы обязательные переменные окружения: {', '.join(missing)}")
+        # Не sys.exit(1): бесконечное ожидание вместо рестарт-лупа
         while True:
             time.sleep(60)
     if not HF_TOKEN:
-        logger.warning("⚠️ HF_TOKEN не задан — AI-режимы будут недоступны, бот будет работать только локально")
+        logger.warning("HF_TOKEN не задан - AI-режимы будут недоступны, бот будет работать только локально")
 
 
 def build_mongo_uri() -> str:
@@ -106,7 +103,7 @@ def build_mongo_uri() -> str:
     password = urllib.parse.quote_plus(MONGO_PASSWORD)
     return (
         f"mongodb+srv://{username}:{password}"
-        f"@cluster0.u62aem5.mongodb.net/?appName=TolikBot"
+        f"@cluster0.u62aem5.mongodb.net/?appName=MCore"
     )
 
 
@@ -118,7 +115,7 @@ web_app = Flask(__name__)
 
 @web_app.route('/')
 def home():
-    return f"Online 🟢 Tolik {BOT_VERSION}"
+    return f"Online MCore {BOT_VERSION}"
 
 
 @web_app.route('/health')
@@ -194,7 +191,7 @@ class SettingsManager:
 
 
 # =========================================================================
-# ЛОКАЛЬНЫЙ МОЗГ (MARKOV) — с LRU eviction
+# ЛОКАЛЬНЫЙ МОЗГ (MARKOV) - с LRU eviction
 # =========================================================================
 class MarkovBrain:
 
@@ -335,14 +332,12 @@ class MarkovBrain:
             'author_id': message.author.id
         })
 
-        if len(tokens) >= 2:
-            for i in range(len(tokens) - 1):
-                self._bounded_append(brain['word_pairs'][tokens[i]], tokens[i + 1])
+        for i in range(len(tokens) - 1):
+            self._bounded_append(brain['word_pairs'][tokens[i]], tokens[i + 1])
 
-        if len(tokens) >= 3:
-            for i in range(len(tokens) - 2):
-                key = f"{tokens[i]} {tokens[i+1]}"
-                self._bounded_append(brain['word_triplets'][key], tokens[i + 2])
+        for i in range(len(tokens) - 2):
+            key = f"{tokens[i]} {tokens[i + 1]}"
+            self._bounded_append(brain['word_triplets'][key], tokens[i + 2])
 
         brain['all_words'].extend(tokens)
 
@@ -435,14 +430,14 @@ class MarkovBrain:
             logger.error(f"Ошибка очистки мозга {gid} в БД: {e}")
 
     async def save_all(self):
-        """Аварийное сохранение всех мозгов при shutdown."""
+        """Сохранение всех мозгов при завершении работы."""
         for gid in list(self.brains.keys()):
             await self._save(gid)
         logger.info("Все мозги сохранены")
 
 
 # =========================================================================
-# AI ИНТЕГРАЦИЯ — с per-user rate limit и очисткой контекста
+# AI ИНТЕГРАЦИЯ - с per-user rate limit и очисткой контекста
 # =========================================================================
 class AIHandler:
 
@@ -454,12 +449,13 @@ class AIHandler:
             try:
                 self.client = InferenceClient(token=HF_TOKEN)
                 self.available = True
-                logger.info("✅ AI Handler инициализирован")
+                logger.info("AI Handler инициализирован")
             except Exception as e:
-                logger.error(f"❌ Ошибка инициализации AI: {e}")
+                logger.error(f"Ошибка инициализации AI: {e}")
         else:
-            logger.warning("⚠️ HF_TOKEN не задан — AI Handler недоступен")
+            logger.warning("HF_TOKEN не задан - AI Handler недоступен")
 
+        # Контекст канала: пары (роль, текст)
         self.contexts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=AI_CONTEXT_MAXLEN))
         self._context_last_used: Dict[int, float] = {}
 
@@ -485,9 +481,9 @@ class AIHandler:
     async def _cleanup_contexts(self):
         """Периодическая очистка неактивных контекстов."""
         while True:
-            await asyncio.sleep(AI_CONTEXT_CLEANUP_INTERVAL)
+            await asyncio.sleep(CLEANUP_INTERVAL)
             now = time.time()
-            dead = [ch for ch, t in self._context_last_used.items() if now - t > AI_CONTEXT_CLEANUP_INTERVAL]
+            dead = [ch for ch, t in self._context_last_used.items() if now - t > CLEANUP_INTERVAL]
             for ch in dead:
                 self.contexts.pop(ch, None)
                 self._context_last_used.pop(ch, None)
@@ -536,11 +532,8 @@ class AIHandler:
             {"role": "system", "content": f"{context_desc}\nОтвечай коротко, не более 1900 символов."}
         ]
 
-        for entry in self.contexts[channel_id]:
-            if entry.startswith("Юзер:"):
-                messages.append({"role": "user", "content": entry[6:].strip()})
-            elif entry.startswith("Толик:"):
-                messages.append({"role": "assistant", "content": entry[6:].strip()})
+        for role, text in self.contexts[channel_id]:
+            messages.append({"role": role, "content": text})
 
         messages.append({"role": "user", "content": prompt})
 
@@ -558,8 +551,8 @@ class AIHandler:
 
             if response and response.choices:
                 answer = response.choices[0].message.content
-                self.contexts[channel_id].append(f"Юзер: {prompt[:200]}")
-                self.contexts[channel_id].append(f"Толик: {answer[:200]}")
+                self.contexts[channel_id].append(("user", prompt[:200]))
+                self.contexts[channel_id].append(("assistant", answer[:200]))
                 self._context_last_used[channel_id] = time.time()
                 return answer
 
@@ -574,7 +567,7 @@ class AIHandler:
 
 
 # =========================================================================
-# АНАЛИЗАТОР ВАЙБА — с периодической очисткой
+# АНАЛИЗАТОР ВАЙБА - с периодической очисткой
 # =========================================================================
 class VibeAnalyzer:
     def __init__(self):
@@ -584,9 +577,9 @@ class VibeAnalyzer:
 
     async def _cleanup_loop(self):
         while True:
-            await asyncio.sleep(VIBE_CLEANUP_INTERVAL)
+            await asyncio.sleep(CLEANUP_INTERVAL)
             now = time.time()
-            dead = [k for k, v in self.stats.items() if now - v["last"] > VIBE_CLEANUP_INTERVAL]
+            dead = [k for k, v in self.stats.items() if now - v["last"] > CLEANUP_INTERVAL]
             for k in dead:
                 del self.stats[k]
             if dead:
@@ -657,7 +650,7 @@ async def _is_safe_host_async(hostname: str) -> bool:
             if now - cached_time < HOST_CACHE_TTL:
                 return cached_result
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def _check():
         try:
@@ -703,7 +696,6 @@ async def parse_link(url: str) -> Optional[str]:
                 if content_length and int(content_length) > MAX_BODY_BYTES:
                     return None
 
-                # bytearray вместо bytes += chunk
                 raw = bytearray()
                 async for chunk in resp.content.iter_chunked(8192):
                     raw.extend(chunk)
@@ -732,21 +724,21 @@ async def parse_link(url: str) -> Optional[str]:
 
 def iq_status(iq: int) -> str:
     if iq < 60:
-        return ":clown:"
+        return "очень низкий"
     elif iq < 80:
-        return ":neutral_face:"
+        return "низкий"
     elif iq < 100:
-        return ":slight_smile:"
+        return "средний"
     elif iq < 130:
-        return ":brain:"
+        return "высокий"
     else:
-        return ":fire:"
+        return "гений"
 
 
 # =========================================================================
 # ОСНОВНОЙ БОТ
 # =========================================================================
-class TolikBot(commands.Bot):
+class MCoreBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
@@ -756,7 +748,6 @@ class TolikBot(commands.Bot):
             command_prefix='/',
             intents=intents,
             help_command=None,
-            activity=discord.Game(name="ROBLOX"),
             status=discord.Status.online
         )
 
@@ -777,10 +768,10 @@ class TolikBot(commands.Bot):
                 minPoolSize=2
             )
             await self.mongo_client.admin.command('ping')
-            logger.info("✅ MongoDB подключена")
+            logger.info("MongoDB подключена")
         except Exception as e:
-            logger.critical(f"❌ Ошибка MongoDB: {e}")
-            # Не sys.exit(1) — бесконечное ожидание
+            logger.critical(f"Ошибка MongoDB: {e}")
+            # Не sys.exit(1): бесконечное ожидание
             while True:
                 await asyncio.sleep(60)
 
@@ -796,17 +787,21 @@ class TolikBot(commands.Bot):
         asyncio.create_task(self.ai._cleanup_contexts())
         asyncio.create_task(self.vibe._cleanup_loop())
 
-        # Graceful shutdown
-        signal.signal(signal.SIGTERM, lambda sig, frame: asyncio.create_task(self._emergency_save()))
-        signal.signal(signal.SIGINT, lambda sig, frame: asyncio.create_task(self._emergency_save()))
+        # Graceful shutdown: при SIGTERM/SIGINT вызываем close(), он сохраняет мозги
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(self.close()))
+            except NotImplementedError:
+                pass
 
         self._register_commands()
 
         try:
             synced = await self.tree.sync()
-            logger.info(f"✅ Синхронизировано {len(synced)} команд")
+            logger.info(f"Синхронизировано {len(synced)} команд")
         except Exception as e:
-            logger.error(f"❌ Ошибка синхронизации: {e}")
+            logger.error(f"Ошибка синхронизации: {e}")
 
     async def _keep_alive_loop(self):
         """Self-ping чтобы Render не усыплял бота."""
@@ -814,20 +809,11 @@ class TolikBot(commands.Bot):
         while True:
             try:
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(f"http://localhost:{PORT}/health", timeout=5):
+                    async with s.get(f"http://localhost:{PORT}/health", timeout=aiohttp.ClientTimeout(total=5)):
                         pass
             except Exception:
                 pass
             await asyncio.sleep(60)
-
-    async def _emergency_save(self):
-        """Аварийное сохранение при SIGTERM/SIGINT."""
-        logger.info("⚠️ Получен сигнал завершения, сохраняю мозги...")
-        if self.brain:
-            await self.brain.save_all()
-        if self.mongo_client:
-            self.mongo_client.close()
-        logger.info("✅ Сохранение завершено")
 
     def _register_commands(self):
         """Регистрация всех команд."""
@@ -850,14 +836,14 @@ class TolikBot(commands.Bot):
 
             if режим.value == "custom" and not settings.get("custom_prompt", ""):
                 await interaction.response.send_message(
-                    "❌ Кастомный промпт не установлен! Используй `/bot prompt` чтобы задать его.",
+                    "Кастомный промпт не установлен! Используй `/bot prompt` чтобы задать его.",
                     ephemeral=True
                 )
                 return
 
             if not self.ai.is_mode_usable(режим.value, settings.get("custom_prompt", "")):
                 await interaction.response.send_message(
-                    "❌ AI режимы недоступны (не настроен HF_TOKEN на сервере бота)",
+                    "AI режимы недоступны (не настроен HF_TOKEN на сервере бота)",
                     ephemeral=True
                 )
                 return
@@ -866,7 +852,7 @@ class TolikBot(commands.Bot):
             await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                f"✅ Режим изменен на: **{режим.name}**",
+                f"Режим изменен на: **{режим.name}**",
                 ephemeral=True
             )
 
@@ -884,7 +870,7 @@ class TolikBot(commands.Bot):
             await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                f"Авто-флуд: {'🟢 включен' if состояние else '🔴 выключен'}",
+                f"Авто-флуд: {'включен' if состояние else 'выключен'}",
                 ephemeral=True
             )
 
@@ -893,7 +879,7 @@ class TolikBot(commands.Bot):
         async def bot_prompt(interaction: discord.Interaction, промпт: str):
             if len(промпт) > 1500:
                 await interaction.response.send_message(
-                    "❌ Промпт слишком длинный! Максимум 1500 символов.",
+                    "Промпт слишком длинный! Максимум 1500 символов.",
                     ephemeral=True
                 )
                 return
@@ -908,7 +894,7 @@ class TolikBot(commands.Bot):
                 color=0x00BFFF,
                 timestamp=discord.utils.utcnow()
             )
-            emb.set_footer(text="Используй /bot mode → Пользовательский для активации")
+            emb.set_footer(text="Используй /bot mode -> Пользовательский для активации")
 
             await interaction.response.send_message(embed=emb, ephemeral=True)
 
@@ -919,7 +905,7 @@ class TolikBot(commands.Bot):
 
             if not prompt:
                 await interaction.response.send_message(
-                    "📝 Кастомный промпт не установлен. Админ может задать его через `/bot prompt`",
+                    "Кастомный промпт не установлен. Админ может задать его через `/bot prompt`",
                     ephemeral=True
                 )
                 return
@@ -969,14 +955,14 @@ class TolikBot(commands.Bot):
             )
 
             embed.add_field(
-                name="📡 Сеть",
+                name="Сеть",
                 value=f"Пинг: `{ping}ms`\nСерверов: `{len(self.guilds)}`\nВерсия: `{BOT_VERSION}`",
                 inline=False
             )
 
             embed.add_field(
                 name="IQ",
-                value=f"**`{iq}`** — {iq_status(iq)}",
+                value=f"**`{iq}`** - {iq_status(iq)}",
                 inline=False
             )
 
@@ -993,7 +979,7 @@ class TolikBot(commands.Bot):
 
             if stats['top_words']:
                 top = "\n".join([
-                    f"{i}. **{w}** — `{c}` раз"
+                    f"{i}. **{w}** - `{c}` раз"
                     for i, (w, c) in enumerate(stats['top_words'], 1)
                 ])
                 embed.add_field(name="Топ слов", value=top, inline=False)
@@ -1004,7 +990,7 @@ class TolikBot(commands.Bot):
             embed.add_field(
                 name="Настройки",
                 value=(
-                    f"Авто-флуд: `{'🟢' if settings['ai_chat'] else '🔴'}`\n"
+                    f"Авто-флуд: `{'вкл' if settings['ai_chat'] else 'выкл'}`\n"
                     f"Шанс ответа: `{int(settings['chat_chance'] * 100)}%`\n"
                     f"Каналы: {channels_text}\n"
                     f"Режим: `{MODE_NAMES.get(settings['mode'], settings['mode'])}`"
@@ -1015,7 +1001,7 @@ class TolikBot(commands.Bot):
             if self.user.avatar:
                 embed.set_thumbnail(url=self.user.avatar.url)
 
-            embed.set_footer(text=f"MCore Tolik • {BOT_VERSION}")
+            embed.set_footer(text=f"MCore | {BOT_VERSION}")
 
             await interaction.followup.send(embed=embed)
 
@@ -1047,7 +1033,7 @@ class TolikBot(commands.Bot):
                 color=0x00BFFF,
                 timestamp=discord.utils.utcnow()
             )
-            emb.set_footer(text=f"Запросил: {interaction.user.display_name} • MCore Tolik")
+            emb.set_footer(text=f"Запросил: {interaction.user.display_name} | MCore")
 
             await interaction.followup.send(embed=emb)
 
@@ -1097,7 +1083,7 @@ class TolikBot(commands.Bot):
                 await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                f"✅ Канал {канал.mention} добавлен в разрешенные",
+                f"Канал {канал.mention} добавлен в разрешенные",
                 ephemeral=True
             )
 
@@ -1110,7 +1096,7 @@ class TolikBot(commands.Bot):
                 await self.settings.save(interaction.guild.id)
 
             await interaction.response.send_message(
-                f"❌ Канал {канал.mention} убран из разрешенных",
+                f"Канал {канал.mention} убран из разрешенных",
                 ephemeral=True
             )
 
@@ -1141,7 +1127,7 @@ class TolikBot(commands.Bot):
                 ephemeral=True
             )
 
-        @self.tree.command(name="topwords", description="Топ-10 слов в лексиконе")
+        @self.tree.command(name="topwords", description="Топ слов в лексиконе")
         async def top_words(interaction: discord.Interaction):
             stats = await self.brain.get_stats(interaction.guild.id)
 
@@ -1157,12 +1143,10 @@ class TolikBot(commands.Bot):
                 color=0x00BFFF
             )
 
-            words_list = "\n".join([
-                f"{i}. **{w}** — `{c}` раз"
+            embed.description = "\n".join([
+                f"{i}. **{w}** - `{c}` раз"
                 for i, (w, c) in enumerate(stats['top_words'], 1)
             ])
-
-            embed.description = words_list
 
             await interaction.response.send_message(embed=embed)
 
@@ -1281,18 +1265,17 @@ def main():
     flask_thread.start()
     logger.info("Веб-сервер запущен")
 
-    bot = TolikBot()
+    bot = MCoreBot()
 
     try:
-        bot.run(TOLIK_TOKEN)
+        bot.run(MCORE_TOKEN)
     except discord.LoginFailure:
-        logger.critical("❌ Неверный токен Discord!")
+        logger.critical("Неверный токен Discord!")
     except Exception as e:
-        logger.critical(f"❌ Критическая ошибка: {type(e).__name__}: {e}")
+        logger.critical(f"Критическая ошибка: {type(e).__name__}: {e}")
     finally:
         logger.info("Процесс завершен")
 
 
 if __name__ == "__main__":
     main()
-
