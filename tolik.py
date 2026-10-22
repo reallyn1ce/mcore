@@ -22,7 +22,6 @@ from bs4 import BeautifulSoup
 from motor.motor_asyncio import AsyncIOMotorClient
 from flask import Flask
 from waitress import serve
-from huggingface_hub import InferenceClient
 
 import discord
 from discord.ext import commands
@@ -32,7 +31,8 @@ from discord import app_commands
 # КОНФИГУРАЦИЯ
 # =========================================================================
 BOT_VERSION = "2.0.4"
-MODEL_NAME = os.environ.get("HF_MODEL", "openai/gpt-oss-120b")
+MODEL_NAME = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 AI_RATE_LIMIT_WINDOW = 60  # секунд
 AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно на пользователя
@@ -45,7 +45,7 @@ logging.basicConfig(
 logger = logging.getLogger("MCore")
 
 MCORE_TOKEN = os.environ.get("MCORE_TOKEN")
-HF_TOKEN = os.environ.get("HF_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 MONGO_USER = os.environ.get("MONGO_USER")
 MONGO_PASSWORD = os.environ.get("MONGO_PASSWORD")
 MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "smmunity_database")
@@ -94,8 +94,8 @@ def validate_config():
         # Не sys.exit(1): бесконечное ожидание вместо рестарт-лупа
         while True:
             time.sleep(60)
-    if not HF_TOKEN:
-        logger.warning("HF_TOKEN не задан - AI-режимы будут недоступны, бот будет работать только локально")
+    if not GROQ_API_KEY:
+        logger.warning("GROQ_API_KEY не задан - AI-режимы будут недоступны, бот будет работать только локально")
 
 
 def build_mongo_uri() -> str:
@@ -442,18 +442,12 @@ class MarkovBrain:
 class AIHandler:
 
     def __init__(self):
-        self.client: Optional[InferenceClient] = None
-        self.available = False
+        self.available = bool(GROQ_API_KEY)
 
-        if HF_TOKEN:
-            try:
-                self.client = InferenceClient(token=HF_TOKEN)
-                self.available = True
-                logger.info("AI Handler инициализирован")
-            except Exception as e:
-                logger.error(f"Ошибка инициализации AI: {e}")
+        if self.available:
+            logger.info(f"AI Handler инициализирован (Groq, модель {MODEL_NAME})")
         else:
-            logger.warning("HF_TOKEN не задан - AI Handler недоступен")
+            logger.warning("GROQ_API_KEY не задан - AI Handler недоступен")
 
         # Контекст канала: пары (роль, текст)
         self.contexts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=AI_CONTEXT_MAXLEN))
@@ -538,19 +532,37 @@ class AIHandler:
         messages.append({"role": "user", "content": prompt})
 
         try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.client.chat_completion,
-                    model=MODEL_NAME,
-                    messages=messages,
-                    max_tokens=500,
-                    temperature=0.7
-                ),
-                timeout=AI_TIMEOUT_SECONDS
-            )
+            headers = {
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": MODEL_NAME,
+                "messages": messages,
+                "max_tokens": 1000,
+                "temperature": 0.7
+            }
 
-            if response and response.choices:
-                answer = response.choices[0].message.content
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    GROQ_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=AI_TIMEOUT_SECONDS)
+                ) as resp:
+                    if resp.status == 429:
+                        logger.warning("Groq: превышен лимит запросов (429)")
+                        return None
+                    if resp.status != 200:
+                        body = (await resp.text())[:300]
+                        logger.error(f"Groq вернул {resp.status}: {body}")
+                        return None
+                    data = await resp.json()
+
+            choices = data.get("choices") or []
+            answer = (choices[0].get("message", {}).get("content") or "").strip() if choices else ""
+
+            if answer:
                 self.contexts[channel_id].append(("user", prompt[:200]))
                 self.contexts[channel_id].append(("assistant", answer[:200]))
                 self._context_last_used[channel_id] = time.time()
@@ -843,7 +855,7 @@ class MCoreBot(commands.Bot):
 
             if not self.ai.is_mode_usable(режим.value, settings.get("custom_prompt", "")):
                 await interaction.response.send_message(
-                    "AI режимы недоступны (не настроен HF_TOKEN на сервере бота)",
+                    "AI режимы недоступны (не настроен GROQ_API_KEY на сервере бота)",
                     ephemeral=True
                 )
                 return
@@ -1279,4 +1291,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
