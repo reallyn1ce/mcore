@@ -1,5 +1,5 @@
 # ====================================================================
-# MCore - Version 2.0.4 (Render Production Ready)
+# MCore - Version 2.1.0 (Render Production Ready)
 # ====================================================================
 import os
 import re
@@ -12,6 +12,7 @@ import urllib.parse
 import time
 import logging
 import signal
+from contextlib import asynccontextmanager
 from threading import Thread
 from collections import defaultdict, deque, Counter
 from typing import Optional, Dict
@@ -30,7 +31,7 @@ from discord import app_commands
 # =========================================================================
 # КОНФИГУРАЦИЯ
 # =========================================================================
-BOT_VERSION = "2.0.4"
+BOT_VERSION = "2.1.0"
 MODEL_NAME = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
@@ -53,6 +54,9 @@ PORT = int(os.environ.get("PORT", 10000))
 
 MAX_CONTINUATIONS = 200
 MAX_PROMPT_CHARS = 2000
+MAX_CUSTOM_PROMPT = 1500
+CHANCE_STEP = 10  # шаг кнопок +/- шанса ответа (%)
+SETTINGS_PANEL_TIMEOUT = 600  # секунд
 AI_TIMEOUT_SECONDS = 20
 MAX_BODY_BYTES = 1_000_000
 LINK_REQUEST_TIMEOUT = 5
@@ -748,6 +752,301 @@ def iq_status(iq: int) -> str:
 
 
 # =========================================================================
+# СТАТУС "ПЕЧАТАЕТ..." (безопасная обертка)
+# =========================================================================
+@asynccontextmanager
+async def safe_typing(channel):
+    """Показывает 'Печатает...' в канале. Если нет прав/канала - молча работает без него."""
+    cm = None
+    if channel is not None and hasattr(channel, "typing"):
+        try:
+            cm = channel.typing()
+            await cm.__aenter__()
+        except Exception as e:
+            logger.debug(f"Не удалось включить typing: {e}")
+            cm = None
+    try:
+        yield
+    finally:
+        if cm is not None:
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+
+# =========================================================================
+# ПАНЕЛЬ НАСТРОЕК (/settings)
+# =========================================================================
+class AdminView(discord.ui.View):
+    """Базовый View: взаимодействовать могут только администраторы."""
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if perms is not None and perms.administrator:
+            return True
+        await interaction.response.send_message(
+            "Эта панель доступна только администраторам.", ephemeral=True
+        )
+        return False
+
+
+class PromptModal(discord.ui.Modal):
+    def __init__(self, parent: "SettingsView", current: str):
+        super().__init__(title="Кастомный промпт")
+        self.parent = parent
+        self.prompt_input = discord.ui.TextInput(
+            label="Промпт личности",
+            style=discord.TextStyle.paragraph,
+            placeholder="Пусто = удалить промпт",
+            required=False,
+            max_length=MAX_CUSTOM_PROMPT,
+            default=current[:MAX_CUSTOM_PROMPT] or None
+        )
+        self.add_item(self.prompt_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        gid = self.parent.guild.id
+        new_prompt = str(self.prompt_input.value or "").strip()
+
+        settings = await self.parent.bot.settings.get(gid)
+        settings["custom_prompt"] = new_prompt
+        notice = "Кастомный промпт сохранен. Выбери режим «Пользовательский», чтобы его использовать."
+        if not new_prompt:
+            notice = "Кастомный промпт удален."
+            if settings.get("mode") == "custom":
+                settings["mode"] = "local"
+                notice += " Режим переключен на «Локальный»."
+
+        await self.parent._save_and_refresh(interaction, settings, notice)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.error(f"Ошибка в PromptModal: {type(error).__name__}: {error}")
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Что-то пошло не так.", ephemeral=True)
+
+
+class ChannelsView(AdminView):
+    """Select со списком каналов. Выбранные = разрешенные; пусто = везде."""
+
+    def __init__(self, parent: "SettingsView", current_ids: list):
+        super().__init__(timeout=120)
+        self.parent = parent
+
+        defaults = []
+        for cid in current_ids:
+            ch = parent.guild.get_channel(cid)
+            if isinstance(ch, discord.TextChannel):
+                defaults.append(ch)
+        defaults = defaults[:25]
+
+        self.channel_select = discord.ui.ChannelSelect(
+            placeholder="Каналы для авто-флуда (пусто = везде)",
+            channel_types=[discord.ChannelType.text],
+            min_values=0,
+            max_values=25,
+            default_values=defaults
+        )
+        self.channel_select.callback = self._on_select
+        self.add_item(self.channel_select)
+
+    async def _on_select(self, interaction: discord.Interaction):
+        gid = self.parent.guild.id
+        ids = [c.id for c in self.channel_select.values]
+
+        settings = await self.parent.bot.settings.get(gid)
+        settings["allowed_channels"] = ids
+        ok = await self.parent.bot.settings.save(gid)
+
+        if not ok:
+            text = "Не удалось сохранить настройки, попробуй ещё раз."
+        elif ids:
+            text = "Авто-флуд разрешен в: " + ", ".join(f"<#{c}>" for c in ids)
+        else:
+            text = "Ограничений нет - бот отвечает во всех каналах."
+
+        await interaction.response.edit_message(content=text, view=None)
+        self.stop()
+        await self.parent.update_origin(settings)
+
+
+class SettingsView(AdminView):
+    def __init__(self, bot: "MCoreBot", guild: discord.Guild, settings: Dict):
+        super().__init__(timeout=SETTINGS_PANEL_TIMEOUT)
+        self.bot = bot
+        self.guild = guild
+        self.origin: Optional[discord.Interaction] = None
+        self._clear_armed = False
+        self._apply_state(settings)
+
+    # ---------- состояние и отрисовка ----------
+    def _apply_state(self, settings: Dict):
+        mode = settings.get("mode", "local")
+        # Новые SelectOption на каждый вызов - объекты не общие между View
+        self.mode_select.options = [
+            discord.SelectOption(label=name, value=key, default=(key == mode))
+            for key, name in MODE_NAMES.items()
+        ]
+
+        ai_chat = settings.get("ai_chat", True)
+        self.toggle_button.label = f"Авто-флуд: {'ВКЛ' if ai_chat else 'ВЫКЛ'}"
+        self.toggle_button.style = discord.ButtonStyle.success if ai_chat else discord.ButtonStyle.danger
+
+        pct = round(settings.get("chat_chance", 0.3) * 100)
+        self.chance_down.disabled = pct <= 0
+        self.chance_up.disabled = pct >= 100
+
+        self.clear_button.label = "Точно очистить?" if self._clear_armed else "Очистить память"
+        self.clear_button.style = discord.ButtonStyle.danger
+
+    def build_embed(self, settings: Dict) -> discord.Embed:
+        mode = settings.get("mode", "local")
+        pct = round(settings.get("chat_chance", 0.3) * 100)
+        channels = settings.get("allowed_channels", [])
+        channels_text = "Везде" if not channels else ", ".join(f"<#{c}>" for c in channels)
+        prompt = settings.get("custom_prompt", "")
+
+        embed = discord.Embed(
+            title="Настройки MCore",
+            color=0x00BFFF,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.add_field(name="Режим", value=MODE_NAMES.get(mode, mode), inline=True)
+        embed.add_field(
+            name="Авто-флуд",
+            value="Включен" if settings.get("ai_chat", True) else "Выключен",
+            inline=True
+        )
+        embed.add_field(name="Шанс ответа", value=f"{pct}%", inline=True)
+        embed.add_field(name="Каналы", value=channels_text[:1024], inline=False)
+
+        if prompt:
+            preview = prompt[:300].replace("```", "'''")
+            embed.add_field(
+                name="Промпт",
+                value=f"```\n{preview}{'...' if len(prompt) > 300 else ''}\n```",
+                inline=False
+            )
+        else:
+            embed.add_field(name="Промпт", value="Не задан", inline=False)
+
+        embed.set_footer(text=f"MCore | {BOT_VERSION}")
+        return embed
+
+    async def _refresh(self, interaction: discord.Interaction, settings: Dict,
+                       notice: Optional[str] = None, armed: bool = False):
+        self._clear_armed = armed
+        self._apply_state(settings)
+        await interaction.response.edit_message(
+            content=notice, embed=self.build_embed(settings), view=self
+        )
+
+    async def _save_and_refresh(self, interaction: discord.Interaction, settings: Dict,
+                                notice: Optional[str] = None):
+        ok = await self.bot.settings.save(self.guild.id)
+        await self._refresh(
+            interaction, settings,
+            notice if ok else "Не удалось сохранить настройки, попробуй ещё раз."
+        )
+
+    async def update_origin(self, settings: Dict):
+        """Обновляет основную панель из другого сообщения (например, из выбора каналов)."""
+        if self.origin is None:
+            return
+        try:
+            self._clear_armed = False
+            self._apply_state(settings)
+            await self.origin.edit_original_response(
+                content=None, embed=self.build_embed(settings), view=self
+            )
+        except discord.HTTPException as e:
+            logger.debug(f"Не удалось обновить панель настроек: {e}")
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.origin is not None:
+            try:
+                await self.origin.edit_original_response(view=self)
+            except discord.HTTPException:
+                pass
+
+    # ---------- компоненты ----------
+    @discord.ui.select(
+        placeholder="Режим личности",
+        options=[discord.SelectOption(label=n, value=k) for k, n in MODE_NAMES.items()],
+        row=0
+    )
+    async def mode_select(self, interaction: discord.Interaction, select: discord.ui.Select):
+        mode = select.values[0]
+        settings = await self.bot.settings.get(self.guild.id)
+        prompt = settings.get("custom_prompt", "")
+
+        if mode == "custom" and not prompt:
+            await self._refresh(interaction, settings, "Сначала задай кастомный промпт кнопкой «Промпт».")
+            return
+
+        if not self.bot.ai.is_mode_usable(mode, prompt):
+            await self._refresh(interaction, settings, "AI-режимы недоступны (не настроен GROQ_API_KEY).")
+            return
+
+        settings["mode"] = mode
+        await self._save_and_refresh(interaction, settings)
+
+    @discord.ui.button(label="Авто-флуд", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await self.bot.settings.get(self.guild.id)
+        settings["ai_chat"] = not settings.get("ai_chat", True)
+        await self._save_and_refresh(interaction, settings)
+
+    async def _change_chance(self, interaction: discord.Interaction, delta: int):
+        settings = await self.bot.settings.get(self.guild.id)
+        pct = round(settings.get("chat_chance", 0.3) * 100)
+        pct = max(0, min(100, pct + delta))
+        settings["chat_chance"] = pct / 100.0
+        await self._save_and_refresh(interaction, settings)
+
+    @discord.ui.button(label=f"-{CHANCE_STEP}%", style=discord.ButtonStyle.secondary, row=1)
+    async def chance_down(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_chance(interaction, -CHANCE_STEP)
+
+    @discord.ui.button(label=f"+{CHANCE_STEP}%", style=discord.ButtonStyle.secondary, row=1)
+    async def chance_up(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._change_chance(interaction, CHANCE_STEP)
+
+    @discord.ui.button(label="Каналы", style=discord.ButtonStyle.primary, row=2)
+    async def channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await self.bot.settings.get(self.guild.id)
+        view = ChannelsView(self, settings.get("allowed_channels", []))
+        await interaction.response.send_message(
+            "Выбери каналы, где разрешен авто-флуд. Снятые галочки = канал убран. "
+            "Пустой выбор = бот отвечает везде.",
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="Промпт", style=discord.ButtonStyle.primary, row=2)
+    async def prompt_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await self.bot.settings.get(self.guild.id)
+        await interaction.response.send_modal(PromptModal(self, settings.get("custom_prompt", "")))
+
+    @discord.ui.button(label="Очистить память", style=discord.ButtonStyle.danger, row=2)
+    async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await self.bot.settings.get(self.guild.id)
+
+        if not self._clear_armed:
+            await self._refresh(
+                interaction, settings,
+                "Нажми «Точно очистить?» ещё раз, чтобы стереть память бота на этом сервере.",
+                armed=True
+            )
+            return
+
+        await self.bot.brain.clear(self.guild.id)
+        await self._refresh(interaction, settings, "Память очищена.")
+
+
+# =========================================================================
 # ОСНОВНОЙ БОТ
 # =========================================================================
 class MCoreBot(commands.Bot):
@@ -760,7 +1059,9 @@ class MCoreBot(commands.Bot):
             command_prefix='/',
             intents=intents,
             help_command=None,
-            status=discord.Status.online
+            status=discord.Status.online,
+            # Реальное число серверов известно только после on_ready - там статус обновится
+            activity=discord.Activity(type=discord.ActivityType.watching, name="серверов...")
         )
 
         self.mongo_client: Optional[AsyncIOMotorClient] = None
@@ -815,6 +1116,34 @@ class MCoreBot(commands.Bot):
         except Exception as e:
             logger.error(f"Ошибка синхронизации: {e}")
 
+    # =========================================================================
+    # СТАТУС (Activity): "Смотрит: X серверов"
+    # =========================================================================
+    @staticmethod
+    def _make_activity(count: int) -> discord.Activity:
+        return discord.Activity(type=discord.ActivityType.watching, name=f"{count} серверов")
+
+    async def _update_presence(self):
+        try:
+            await self.change_presence(
+                status=discord.Status.online,
+                activity=self._make_activity(len(self.guilds))
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось обновить статус: {type(e).__name__}: {e}")
+
+    async def on_ready(self):
+        logger.info(f"Бот запущен как {self.user} (серверов: {len(self.guilds)})")
+        await self._update_presence()
+
+    async def on_guild_join(self, guild: discord.Guild):
+        logger.info(f"Новый сервер: {guild.name} ({guild.id})")
+        await self._update_presence()
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        logger.info(f"Удален с сервера: {guild.name} ({guild.id})")
+        await self._update_presence()
+
     async def _keep_alive_loop(self):
         """Self-ping чтобы Render не усыплял бота."""
         await asyncio.sleep(30)
@@ -830,85 +1159,14 @@ class MCoreBot(commands.Bot):
     def _register_commands(self):
         """Регистрация всех команд."""
 
-        # ========== ГРУППА BOT ==========
+        # ========== ГРУППА BOT (остались только clear и promptshow) ==========
         bot_group = app_commands.Group(name="bot", description="Управление ботом")
-
-        @bot_group.command(name="mode", description="Режим личности")
-        @app_commands.choices(режим=[
-            app_commands.Choice(name="Локальный", value="local"),
-            app_commands.Choice(name="Брат", value="buddy"),
-            app_commands.Choice(name="Агрессивный", value="aggressive"),
-            app_commands.Choice(name="Дружелюбный", value="friendly"),
-            app_commands.Choice(name="Мудрец", value="wise"),
-            app_commands.Choice(name="Пользовательский", value="custom")
-        ])
-        @app_commands.default_permissions(administrator=True)
-        async def bot_mode(interaction: discord.Interaction, режим: app_commands.Choice[str]):
-            settings = await self.settings.get(interaction.guild.id)
-
-            if режим.value == "custom" and not settings.get("custom_prompt", ""):
-                await interaction.response.send_message(
-                    "Кастомный промпт не установлен! Используй `/bot prompt` чтобы задать его.",
-                    ephemeral=True
-                )
-                return
-
-            if not self.ai.is_mode_usable(режим.value, settings.get("custom_prompt", "")):
-                await interaction.response.send_message(
-                    "AI режимы недоступны (не настроен GROQ_API_KEY на сервере бота)",
-                    ephemeral=True
-                )
-                return
-
-            settings["mode"] = режим.value
-            await self.settings.save(interaction.guild.id)
-
-            await interaction.response.send_message(
-                f"Режим изменен на: **{режим.name}**",
-                ephemeral=True
-            )
 
         @bot_group.command(name="clear", description="Очистить память бота")
         @app_commands.default_permissions(administrator=True)
         async def bot_clear(interaction: discord.Interaction):
             await self.brain.clear(interaction.guild.id)
             await interaction.response.send_message("Память очищена!", ephemeral=True)
-
-        @bot_group.command(name="working", description="Авто-флуд вкл/выкл")
-        @app_commands.default_permissions(administrator=True)
-        async def bot_working(interaction: discord.Interaction, состояние: bool):
-            settings = await self.settings.get(interaction.guild.id)
-            settings["ai_chat"] = состояние
-            await self.settings.save(interaction.guild.id)
-
-            await interaction.response.send_message(
-                f"Авто-флуд: {'включен' if состояние else 'выключен'}",
-                ephemeral=True
-            )
-
-        @bot_group.command(name="prompt", description="Установить кастомный промпт")
-        @app_commands.default_permissions(administrator=True)
-        async def bot_prompt(interaction: discord.Interaction, промпт: str):
-            if len(промпт) > 1500:
-                await interaction.response.send_message(
-                    "Промпт слишком длинный! Максимум 1500 символов.",
-                    ephemeral=True
-                )
-                return
-
-            settings = await self.settings.get(interaction.guild.id)
-            settings["custom_prompt"] = промпт
-            await self.settings.save(interaction.guild.id)
-
-            emb = discord.Embed(
-                title="Кастомный промпт установлен",
-                description=f"```\n{промпт[:1000]}{'...' if len(промпт) > 1000 else ''}\n```",
-                color=0x00BFFF,
-                timestamp=discord.utils.utcnow()
-            )
-            emb.set_footer(text="Используй /bot mode -> Пользовательский для активации")
-
-            await interaction.response.send_message(embed=emb, ephemeral=True)
 
         @bot_group.command(name="promptshow", description="Показать кастомный промпт")
         async def bot_promptshow(interaction: discord.Interaction):
@@ -917,7 +1175,7 @@ class MCoreBot(commands.Bot):
 
             if not prompt:
                 await interaction.response.send_message(
-                    "Кастомный промпт не установлен. Админ может задать его через `/bot prompt`",
+                    "Кастомный промпт не установлен. Админ может задать его через `/settings`",
                     ephemeral=True
                 )
                 return
@@ -931,27 +1189,30 @@ class MCoreBot(commands.Bot):
 
             await interaction.response.send_message(embed=emb, ephemeral=True)
 
-        @bot_group.command(name="promptclear", description="Удалить кастомный промпт")
-        @app_commands.default_permissions(administrator=True)
-        async def bot_promptclear(interaction: discord.Interaction):
-            settings = await self.settings.get(interaction.guild.id)
-            settings["custom_prompt"] = ""
-            if settings.get("mode") == "custom":
-                settings["mode"] = "local"
-            await self.settings.save(interaction.guild.id)
-
-            await interaction.response.send_message(
-                "Кастомный промпт удалён!",
-                ephemeral=True
-            )
-
         self.tree.add_command(bot_group)
 
-        # ========== ГРУППА INFO ==========
-        info_group = app_commands.Group(name="info", description="Информация")
+        # ========== ПАНЕЛЬ НАСТРОЕК ==========
+        @self.tree.command(name="settings", description="Панель настроек бота (только админы)")
+        @app_commands.default_permissions(administrator=True)
+        @app_commands.guild_only()
+        async def settings_panel(interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message(
+                    "Эта команда доступна только администраторам.", ephemeral=True
+                )
+                return
 
-        @info_group.command(name="bot", description="Статистика и IQ бота")
-        async def info_bot(interaction: discord.Interaction):
+            settings = await self.settings.get(interaction.guild.id)
+            view = SettingsView(self, interaction.guild, settings)
+            await interaction.response.send_message(
+                embed=view.build_embed(settings), view=view, ephemeral=True
+            )
+            view.origin = interaction
+
+        # ========== INFO ==========
+        @self.tree.command(name="info", description="Статистика, IQ и настройки бота")
+        @app_commands.guild_only()
+        async def info_cmd(interaction: discord.Interaction):
             await interaction.response.defer()
 
             settings = await self.settings.get(interaction.guild.id)
@@ -1003,7 +1264,7 @@ class MCoreBot(commands.Bot):
                 name="Настройки",
                 value=(
                     f"Авто-флуд: `{'вкл' if settings['ai_chat'] else 'выкл'}`\n"
-                    f"Шанс ответа: `{int(settings['chat_chance'] * 100)}%`\n"
+                    f"Шанс ответа: `{int(round(settings['chat_chance'] * 100))}%`\n"
                     f"Каналы: {channels_text}\n"
                     f"Режим: `{MODE_NAMES.get(settings['mode'], settings['mode'])}`"
                 ),
@@ -1017,8 +1278,6 @@ class MCoreBot(commands.Bot):
 
             await interaction.followup.send(embed=embed)
 
-        self.tree.add_command(info_group)
-
         # ========== ГРУППА GENERATE ==========
         gen_group = app_commands.Group(name="generate", description="Генерация контента")
 
@@ -1029,15 +1288,16 @@ class MCoreBot(commands.Bot):
             custom_prompt = settings.get("custom_prompt", "")
 
             result = None
-            if self.ai.is_mode_usable(mode, custom_prompt) and mode != "local":
-                result = await self.ai.generate(
-                    interaction.channel.id, ai_prompt, mode, custom_prompt,
-                    guild_id=interaction.guild.id,
-                    user_id=interaction.user.id
-                )
+            async with safe_typing(interaction.channel):
+                if self.ai.is_mode_usable(mode, custom_prompt) and mode != "local":
+                    result = await self.ai.generate(
+                        interaction.channel_id, ai_prompt, mode, custom_prompt,
+                        guild_id=interaction.guild.id,
+                        user_id=interaction.user.id
+                    )
 
-            if not result:
-                result = await fallback_fn()
+                if not result:
+                    result = await fallback_fn()
 
             emb = discord.Embed(
                 title=embed_title,
@@ -1084,60 +1344,6 @@ class MCoreBot(commands.Bot):
             await _generate_and_reply(interaction, "Напиши короткую историю.", fallback, "Короткая история")
 
         self.tree.add_command(gen_group)
-
-        # ========== КОМАНДЫ КАНАЛОВ ==========
-        @self.tree.command(name="addchannel", description="Добавить канал для авто-флуда")
-        @app_commands.default_permissions(administrator=True)
-        async def add_channel(interaction: discord.Interaction, канал: discord.TextChannel):
-            settings = await self.settings.get(interaction.guild.id)
-            if канал.id not in settings["allowed_channels"]:
-                settings["allowed_channels"].append(канал.id)
-                await self.settings.save(interaction.guild.id)
-
-            await interaction.response.send_message(
-                f"Канал {канал.mention} добавлен в разрешенные",
-                ephemeral=True
-            )
-
-        @self.tree.command(name="removechannel", description="Убрать канал из авто-флуда")
-        @app_commands.default_permissions(administrator=True)
-        async def remove_channel(interaction: discord.Interaction, канал: discord.TextChannel):
-            settings = await self.settings.get(interaction.guild.id)
-            if канал.id in settings["allowed_channels"]:
-                settings["allowed_channels"].remove(канал.id)
-                await self.settings.save(interaction.guild.id)
-
-            await interaction.response.send_message(
-                f"Канал {канал.mention} убран из разрешенных",
-                ephemeral=True
-            )
-
-        @self.tree.command(name="clearchannels", description="Сбросить ограничения каналов")
-        @app_commands.default_permissions(administrator=True)
-        async def clear_channels(interaction: discord.Interaction):
-            settings = await self.settings.get(interaction.guild.id)
-            settings["allowed_channels"] = []
-            await self.settings.save(interaction.guild.id)
-
-            await interaction.response.send_message(
-                "Бот будет отвечать во всех каналах!",
-                ephemeral=True
-            )
-
-        @self.tree.command(name="setchance", description="Установить шанс авто-ответа")
-        @app_commands.default_permissions(administrator=True)
-        async def set_chance(
-            interaction: discord.Interaction,
-            процент: app_commands.Range[int, 1, 100]
-        ):
-            settings = await self.settings.get(interaction.guild.id)
-            settings["chat_chance"] = процент / 100.0
-            await self.settings.save(interaction.guild.id)
-
-            await interaction.response.send_message(
-                f"Шанс авто-ответа: **{процент}%**",
-                ephemeral=True
-            )
 
         @self.tree.command(name="topwords", description="Топ слов в лексиконе")
         async def top_words(interaction: discord.Interaction):
@@ -1213,7 +1419,7 @@ class MCoreBot(commands.Bot):
             await self.process_commands(message)
             return
 
-        async with message.channel.typing():
+        async with safe_typing(message.channel):
             await asyncio.sleep(random.uniform(1.0, 2.0))
 
             response = None
