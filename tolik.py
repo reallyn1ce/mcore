@@ -45,12 +45,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MCore")
 
-MCORE_TOKEN = os.environ.get("MCORE_TOKEN")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-MONGO_USER = os.environ.get("MONGO_USER")
-MONGO_PASSWORD = os.environ.get("MONGO_PASSWORD")
-MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "smmunity_database")
-PORT = int(os.environ.get("PORT", 10000))
+# Значения конфигурации обновляются в validate_config() непосредственно
+# перед запуском. Это также защищает от раннего чтения ENV при импорте модуля.
+MCORE_TOKEN = ""
+GROQ_API_KEY = ""
+MONGO_USER = ""
+MONGO_PASSWORD = ""
+MONGO_DB_NAME = "smmunity_database"
+PORT = 10000
+
+
+def _read_env(name: str, default: str = "") -> str:
+    """Читает ENV без случайных пробелов/переносов по краям."""
+    value = os.environ.get(name)
+    return value.strip() if value is not None else default
 
 MAX_CONTINUATIONS = 200
 MAX_PROMPT_CHARS = 2000
@@ -86,20 +94,60 @@ MODE_NAMES = {
 
 
 def validate_config():
-    missing = []
-    if not MCORE_TOKEN:
-        missing.append("MCORE_TOKEN")
-    if not MONGO_USER:
-        missing.append("MONGO_USER")
-    if not MONGO_PASSWORD:
-        missing.append("MONGO_PASSWORD")
+    """Загружает ENV непосредственно перед запуском и проверяет обязательные поля."""
+    global MCORE_TOKEN, GROQ_API_KEY, MONGO_USER, MONGO_PASSWORD
+    global MONGO_DB_NAME, PORT, MODEL_NAME
+
+    MCORE_TOKEN = _read_env("MCORE_TOKEN")
+    GROQ_API_KEY = _read_env("GROQ_API_KEY")
+    MONGO_USER = _read_env("MONGO_USER")
+    MONGO_PASSWORD = _read_env("MONGO_PASSWORD")
+    MONGO_DB_NAME = _read_env("MONGO_DB_NAME", "smmunity_database")
+    MODEL_NAME = _read_env("GROQ_MODEL", "openai/gpt-oss-120b")
+
+    port_value = _read_env("PORT", "10000")
+    try:
+        PORT = int(port_value)
+        if not 1 <= PORT <= 65535:
+            raise ValueError("PORT вне диапазона 1..65535")
+    except ValueError:
+        logger.warning("Некорректный PORT; используется 10000")
+        PORT = 10000
+
+    required = {
+        "MCORE_TOKEN": MCORE_TOKEN,
+        "MONGO_USER": MONGO_USER,
+        "MONGO_PASSWORD": MONGO_PASSWORD,
+    }
+    missing = [name for name, value in required.items() if not value]
+
+    # Диагностика показывает только наличие переменных, никогда не их значения.
+    logger.info(
+        "ENV status: " + ", ".join(
+            f"{name}={'OK' if value else 'MISSING'}"
+            for name, value in required.items()
+        )
+    )
+
     if missing:
-        logger.critical(f"Не заданы обязательные переменные окружения: {', '.join(missing)}")
-        # Не sys.exit(1): бесконечное ожидание вместо рестарт-лупа
-        while True:
-            time.sleep(60)
+        visible_names = sorted(
+            name for name in os.environ
+            if any(part in name.upper() for part in ("MCORE", "MONGO", "TOKEN", "PASSWORD"))
+        )
+        logger.critical(
+            "Не заданы обязательные ENV: %s. "
+            "Проверь точное написание Name в панели Botkeep. "
+            "Похожие имена, обнаруженные в окружении: %s",
+            ", ".join(missing),
+            ", ".join(visible_names) if visible_names else "(нет)"
+        )
+        raise SystemExit(1)
+
     if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY не задан - AI-режимы будут недоступны, бот будет работать только локально")
+        logger.warning(
+            "GROQ_API_KEY не задан - AI-режимы будут недоступны, "
+            "бот будет работать только локально"
+        )
 
 
 def build_mongo_uri() -> str:
