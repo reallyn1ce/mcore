@@ -1,6 +1,6 @@
-====================================================================
-MCore - Version 2.1.0 (Render Production Ready)
-====================================================================
+# ====================================================================
+# MCore - Version 2.1.0 (Botkeep Production Ready)
+# ====================================================================
 import os
 import re
 import sys
@@ -17,6 +17,7 @@ from threading import Thread
 from collections import defaultdict, deque, Counter
 from typing import Optional, Dict
 from urllib.parse import urlparse
+
 import aiohttp
 from bs4 import BeautifulSoup
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -26,14 +27,15 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-=========================================================================
-КОНФИГУРАЦИЯ
-=========================================================================
+# =========================================================================
+# КОНФИГУРАЦИЯ
+# =========================================================================
 BOT_VERSION = "2.1.0"
 MODEL_NAME = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
-AI_RATE_LIMIT_WINDOW = 60  # секунд
-AI_RATE_LIMIT_MAX_REQUESTS = 5  # запросов за окно на пользователя
+AI_RATE_LIMIT_WINDOW = 60
+AI_RATE_LIMIT_MAX_REQUESTS = 5
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -48,65 +50,78 @@ MONGO_PASSWORD = ""
 MONGO_DB_NAME = "smmunity_database"
 PORT = 10000
 
+
 def _read_env(name: str, default: str = "") -> str:
     """Читает ENV без случайных пробелов/переносов по краям."""
     value = os.environ.get(name)
     return value.strip() if value is not None else default
 
+
 def load_env_file():
     """Загружает переменные из .env файла (Botkeep пишет ENV именно туда)."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
-    if not os.path.exists(env_path):
-        # Пробуем также текущую рабочую директорию
-        env_path = '.env'
-    if not os.path.exists(env_path):
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'),
+        os.path.join(os.getcwd(), '.env'),
+        '/home/container/.env',
+    ]
+    env_path = next((p for p in candidates if os.path.exists(p)), None)
+    if env_path is None:
         logger.info(".env файл не найден, используем системное окружение")
         return
     logger.info(f"Загружаем .env из: {env_path}")
-    with open(env_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            if '=' in line:
+    try:
+        with open(env_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('export '):
+                    line = line[len('export '):].strip()
+                if '=' not in line:
+                    continue
                 key, value = line.split('=', 1)
                 key = key.strip()
                 value = value.strip()
-                # Убираем кавычки если есть
                 if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
                     value = value[1:-1]
-                if key and value is not None:
+                if key:
                     os.environ.setdefault(key, value)
-    logger.info(".env файл загружен")
+        logger.info(".env файл загружен")
+    except Exception as e:
+        logger.error(f"Не удалось прочитать .env: {e}")
+
 
 MAX_CONTINUATIONS = 200
 MAX_PROMPT_CHARS = 2000
 MAX_CUSTOM_PROMPT = 1500
-CHANCE_STEP = 10  # шаг кнопок +/- шанса ответа (%)
-SETTINGS_PANEL_TIMEOUT = 600  # секунд
+CHANCE_STEP = 10
+SETTINGS_PANEL_TIMEOUT = 600
 AI_TIMEOUT_SECONDS = 20
 MAX_BODY_BYTES = 1_000_000
 LINK_REQUEST_TIMEOUT = 5
 BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "169.254.169.254"}
 HOST_CACHE_TTL = 300
-MAX_CACHED_BRAINS = 50  # LRU eviction
-BRAIN_IDLE_TTL = 600    # 10 минут без использования - выгружаем
-AI_CONTEXT_MAXLEN = 12  # 6 диалогов
-CLEANUP_INTERVAL = 3600  # раз в час
+MAX_CACHED_BRAINS = 50
+BRAIN_IDLE_TTL = 600
+AI_CONTEXT_MAXLEN = 12
+CLEANUP_INTERVAL = 3600
+
 PERSONALITIES = {
-    "buddy":    "Ты - MCore. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
-    "aggressive":  "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Отвечай агрессией на агрессию. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)",
+    "buddy": "Ты - MCore. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
+    "aggressive": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Отвечай агрессией на агрессию. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)",
     "friendly": "Ты - MCore. Отвечай добротой на доброту. Говори о себе в мужском роде. Отвечай кратко. (1-3 предложения)",
-    "wise":     "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)."
+    "wise": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)."
 }
+
 MODE_NAMES = {
-    "local":    "Локальный",
-    "buddy":    "Брат",
-    "aggressive":  "Агрессивный",
+    "local": "Локальный",
+    "buddy": "Брат",
+    "aggressive": "Агрессивный",
     "friendly": "Дружелюбный",
-    "wise":     "Мудрец",
-    "custom":   "Пользовательский"
+    "wise": "Мудрец",
+    "custom": "Пользовательский"
 }
+
 
 def validate_config():
     """Загружает ENV непосредственно перед запуском и проверяет обязательные поля."""
@@ -158,6 +173,7 @@ def validate_config():
             "бот будет работать только локально"
         )
 
+
 def build_mongo_uri() -> str:
     username = urllib.parse.quote_plus(MONGO_USER)
     password = urllib.parse.quote_plus(MONGO_PASSWORD)
@@ -166,25 +182,30 @@ def build_mongo_uri() -> str:
         f"@cluster0.u62aem5.mongodb.net/?appName=MCore"
     )
 
-=========================================================================
-ВЕБ-СЕРВЕР ДЛЯ RENDER
-=========================================================================
+
+# =========================================================================
+# ВЕБ-СЕРВЕР
+# =========================================================================
 web_app = Flask(__name__)
+
 
 @web_app.route('/')
 def home():
     return f"Online MCore {BOT_VERSION}"
 
+
 @web_app.route('/health')
 def health():
     return {"status": "ok", "version": BOT_VERSION}, 200
 
+
 def run_flask():
     serve(web_app, host='0.0.0.0', port=PORT, threads=4)
 
-=========================================================================
-МЕНЕДЖЕР НАСТРОЕК
-=========================================================================
+
+# =========================================================================
+# МЕНЕДЖЕР НАСТРОЕК
+# =========================================================================
 class SettingsManager:
     DEFAULT = {
         "ai_chat": True,
@@ -240,9 +261,10 @@ class SettingsManager:
             logger.error(f"Ошибка сохранения настроек сервера {guild_id}: {e}")
             return False
 
-=========================================================================
-ЛОКАЛЬНЫЙ МОЗГ (MARKOV) - с LRU eviction
-=========================================================================
+
+# =========================================================================
+# ЛОКАЛЬНЫЙ МОЗГ (MARKOV)
+# =========================================================================
 class MarkovBrain:
     def __init__(self, db):
         self.db = db
@@ -447,9 +469,10 @@ class MarkovBrain:
             await self._save(gid)
         logger.info("Все мозги сохранены")
 
-=========================================================================
-AI ИНТЕГРАЦИЯ - с per-user rate limit и очисткой контекста
-=========================================================================
+
+# =========================================================================
+# AI ИНТЕГРАЦИЯ
+# =========================================================================
 class AIHandler:
     def __init__(self):
         self.available = bool(GROQ_API_KEY)
@@ -564,9 +587,10 @@ class AIHandler:
             logger.error(f"Ошибка AI генерации: {type(e).__name__}: {e}")
             return None
 
-=========================================================================
-АНАЛИЗАТОР ВАЙБА - с периодической очисткой
-=========================================================================
+
+# =========================================================================
+# АНАЛИЗАТОР ВАЙБА
+# =========================================================================
 class VibeAnalyzer:
     def __init__(self):
         self.stats: Dict[int, Dict] = defaultdict(
@@ -602,12 +626,14 @@ class VibeAnalyzer:
             return "buddy"
         return None
 
-=========================================================================
-ПАРСЕР ССЫЛОК (с асинхронным кэшем и bytearray)
-=========================================================================
+
+# =========================================================================
+# ПАРСЕР ССЫЛОК
+# =========================================================================
 _host_safety_cache: Dict[str, tuple] = {}
 _host_cache_lock = asyncio.Lock()
 _host_cache_last_cleanup = time.time()
+
 
 async def _cleanup_host_cache_if_needed():
     global _host_cache_last_cleanup
@@ -622,6 +648,7 @@ async def _cleanup_host_cache_if_needed():
         if expired:
             logger.debug(f"Очищено {len(expired)} записей кэша хостов")
 
+
 async def _is_safe_host_async(hostname: str) -> bool:
     if not hostname:
         return False
@@ -635,6 +662,7 @@ async def _is_safe_host_async(hostname: str) -> bool:
             if now - cached_time < HOST_CACHE_TTL:
                 return cached_result
     loop = asyncio.get_running_loop()
+
     def _check():
         try:
             addr_info = socket.getaddrinfo(hostname, None)
@@ -645,11 +673,13 @@ async def _is_safe_host_async(hostname: str) -> bool:
             if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
                 return False
         return True
+
     is_safe = await loop.run_in_executor(None, _check)
     async with _host_cache_lock:
         _host_safety_cache[hostname_lower] = (is_safe, now)
     await _cleanup_host_cache_if_needed()
     return is_safe
+
 
 async def parse_link(url: str) -> Optional[str]:
     try:
@@ -691,6 +721,7 @@ async def parse_link(url: str) -> Optional[str]:
         logger.debug(f"Не удалось распарсить ссылку {url}: {e}")
         return None
 
+
 def iq_status(iq: int) -> str:
     if iq < 60:
         return "очень низкий"
@@ -703,9 +734,10 @@ def iq_status(iq: int) -> str:
     else:
         return "гений"
 
-=========================================================================
-СТАТУС "ПЕЧАТАЕТ..." (безопасная обертка)
-=========================================================================
+
+# =========================================================================
+# СТАТУС "ПЕЧАТАЕТ..."
+# =========================================================================
 @asynccontextmanager
 async def safe_typing(channel):
     cm = None
@@ -725,9 +757,10 @@ async def safe_typing(channel):
             except Exception:
                 pass
 
-=========================================================================
-ПАНЕЛЬ НАСТРОЕК (/settings)
-=========================================================================
+
+# =========================================================================
+# ПАНЕЛЬ НАСТРОЕК (/settings)
+# =========================================================================
 class AdminView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         perms = getattr(interaction.user, "guild_permissions", None)
@@ -737,6 +770,7 @@ class AdminView(discord.ui.View):
             "Эта панель доступна только администраторам.", ephemeral=True
         )
         return False
+
 
 class PromptModal(discord.ui.Modal):
     def __init__(self, parent: "SettingsView", current: str):
@@ -769,6 +803,7 @@ class PromptModal(discord.ui.Modal):
         logger.error(f"Ошибка в PromptModal: {type(error).__name__}: {error}")
         if not interaction.response.is_done():
             await interaction.response.send_message("Что-то пошло не так.", ephemeral=True)
+
 
 class ChannelsView(AdminView):
     def __init__(self, parent: "SettingsView", current_ids: list):
@@ -805,6 +840,7 @@ class ChannelsView(AdminView):
         await interaction.response.edit_message(content=text, view=None)
         self.stop()
         await self.parent.update_origin(settings)
+
 
 class SettingsView(AdminView):
     def __init__(self, bot: "MCoreBot", guild: discord.Guild, settings: Dict):
@@ -966,9 +1002,10 @@ class SettingsView(AdminView):
         await self.bot.brain.clear(self.guild.id)
         await self._refresh(interaction, settings, "Память очищена.")
 
-=========================================================================
-ОСНОВНОЙ БОТ
-=========================================================================
+
+# =========================================================================
+# ОСНОВНОЙ БОТ
+# =========================================================================
 class MCoreBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
@@ -1308,11 +1345,12 @@ class MCoreBot(commands.Bot):
         await super().close()
         logger.info("Бот остановлен")
 
-=========================================================================
-ТОЧКА ВХОДА
-=========================================================================
+
+# =========================================================================
+# ТОЧКА ВХОДА
+# =========================================================================
 def main():
-    load_env_file()  # <-- ЗАГРУЖАЕМ .env ФАЙЛ ПЕРЕД ВСЕМ ОСТАЛЬНЫМ
+    load_env_file()
     validate_config()
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
@@ -1327,6 +1365,6 @@ def main():
     finally:
         logger.info("Процесс завершен")
 
+
 if __name__ == "__main__":
     main()
-    
