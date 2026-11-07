@@ -1,5 +1,5 @@
 # ====================================================================
-# MCore - Version 2.1.0 (Botkeep Production Ready)
+# MCore - Version 2.2.0
 # ====================================================================
 import os
 import re
@@ -16,7 +16,6 @@ from contextlib import asynccontextmanager
 from threading import Thread
 from collections import defaultdict, deque, Counter
 from typing import Optional, Dict
-from urllib.parse import urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -30,8 +29,8 @@ from discord import app_commands
 # =========================================================================
 # КОНФИГУРАЦИЯ
 # =========================================================================
-BOT_VERSION = "2.1.0"
-MODEL_NAME = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+BOT_VERSION = "2.2.0"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 AI_RATE_LIMIT_WINDOW = 60
 AI_RATE_LIMIT_MAX_REQUESTS = 5
@@ -43,17 +42,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MCore")
 
-MCORE_TOKEN = ""
-GROQ_API_KEY = ""
-MONGO_USER = ""
-MONGO_PASSWORD = ""
-MONGO_DB_NAME = "smmunity_database"
-PORT = 10000
+MAX_CONTINUATIONS = 200
+MAX_PROMPT_CHARS = 2000
+MAX_CUSTOM_PROMPT = 1500
+CHANCE_STEP = 10
+SETTINGS_PANEL_TIMEOUT = 600
+AI_TIMEOUT_SECONDS = 20
+MAX_BODY_BYTES = 1_000_000
+LINK_REQUEST_TIMEOUT = 5
+BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "169.254.169.254"}
+HOST_CACHE_TTL = 300
+MAX_CACHED_BRAINS = 50
+BRAIN_IDLE_TTL = 600
+AI_CONTEXT_MAXLEN = 12
+CLEANUP_INTERVAL = 3600
+
+PERSONALITIES = {
+    "buddy": "Ты - MCore. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
+    "aggressive": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Отвечай агрессией на агрессию. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)",
+    "friendly": "Ты - MCore. Отвечай добротой на доброту. Говори о себе в мужском роде. Отвечай кратко. (1-3 предложения)",
+    "wise": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)."
+}
+
+MODE_NAMES = {
+    "local": "Локальный",
+    "buddy": "Брат",
+    "aggressive": "Агрессивный",
+    "friendly": "Дружелюбный",
+    "wise": "Мудрец",
+    "custom": "Пользовательский"
+}
 
 
-def _read_env(name: str, default: str = "") -> str:
-    """Читает ENV без случайных пробелов/переносов по краям."""
-    value = os.environ.get(name)
+def _env(name: str, default: str = "") -> str:
+    """Читает переменную окружения без лишних пробелов/переносов по краям."""
+    value = os.getenv(name)
     return value.strip() if value is not None else default
 
 
@@ -91,96 +114,83 @@ def load_env_file():
         logger.error(f"Не удалось прочитать .env: {e}")
 
 
-MAX_CONTINUATIONS = 200
-MAX_PROMPT_CHARS = 2000
-MAX_CUSTOM_PROMPT = 1500
-CHANCE_STEP = 10
-SETTINGS_PANEL_TIMEOUT = 600
-AI_TIMEOUT_SECONDS = 20
-MAX_BODY_BYTES = 1_000_000
-LINK_REQUEST_TIMEOUT = 5
-BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "169.254.169.254"}
-HOST_CACHE_TTL = 300
-MAX_CACHED_BRAINS = 50
-BRAIN_IDLE_TTL = 600
-AI_CONTEXT_MAXLEN = 12
-CLEANUP_INTERVAL = 3600
+class Config:
+    """Все настройки берутся только из окружения (см. README.md)."""
 
-PERSONALITIES = {
-    "buddy": "Ты - MCore. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
-    "aggressive": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Отвечай агрессией на агрессию. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)",
-    "friendly": "Ты - MCore. Отвечай добротой на доброту. Говори о себе в мужском роде. Отвечай кратко. (1-3 предложения)",
-    "wise": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)."
-}
+    def __init__(self):
+        self.token = ""
+        self.groq_api_key = ""
+        self.groq_model = DEFAULT_GROQ_MODEL
+        self.mongo_uri = ""
+        self.mongo_user = ""
+        self.mongo_password = ""
+        self.mongo_host = ""
+        self.mongo_app_name = "MCore"
+        self.mongo_db_name = ""
+        self.port = 10000
 
-MODE_NAMES = {
-    "local": "Локальный",
-    "buddy": "Брат",
-    "aggressive": "Агрессивный",
-    "friendly": "Дружелюбный",
-    "wise": "Мудрец",
-    "custom": "Пользовательский"
-}
+    def load(self):
+        self.token = _env("MCORE_TOKEN")
+        self.groq_api_key = _env("GROQ_API_KEY")
+        self.groq_model = _env("GROQ_MODEL", DEFAULT_GROQ_MODEL)
+        self.mongo_uri = _env("MONGO_URI")
+        self.mongo_user = _env("MONGO_USER")
+        self.mongo_password = _env("MONGO_PASSWORD")
+        self.mongo_host = _env("MONGO_HOST")
+        self.mongo_app_name = _env("MONGO_APP_NAME", "MCore")
+        self.mongo_db_name = _env("MONGO_DB_NAME")
+        try:
+            self.port = int(_env("PORT", "10000"))
+            if not 1 <= self.port <= 65535:
+                raise ValueError("PORT вне диапазона 1..65535")
+        except ValueError:
+            logger.warning("Некорректный PORT; используется 10000")
+            self.port = 10000
 
-
-def validate_config():
-    """Загружает ENV непосредственно перед запуском и проверяет обязательные поля."""
-    global MCORE_TOKEN, GROQ_API_KEY, MONGO_USER, MONGO_PASSWORD
-    global MONGO_DB_NAME, PORT, MODEL_NAME
-    MCORE_TOKEN = _read_env("MCORE_TOKEN")
-    GROQ_API_KEY = _read_env("GROQ_API_KEY")
-    MONGO_USER = _read_env("MONGO_USER")
-    MONGO_PASSWORD = _read_env("MONGO_PASSWORD")
-    MONGO_DB_NAME = _read_env("MONGO_DB_NAME", "smmunity_database")
-    MODEL_NAME = _read_env("GROQ_MODEL", "openai/gpt-oss-120b")
-    port_value = _read_env("PORT", "10000")
-    try:
-        PORT = int(port_value)
-        if not 1 <= PORT <= 65535:
-            raise ValueError("PORT вне диапазона 1..65535")
-    except ValueError:
-        logger.warning("Некорректный PORT; используется 10000")
-        PORT = 10000
-
-    required = {
-        "MCORE_TOKEN": MCORE_TOKEN,
-        "MONGO_USER": MONGO_USER,
-        "MONGO_PASSWORD": MONGO_PASSWORD,
-    }
-    missing = [name for name, value in required.items() if not value]
-    logger.info(
-        "ENV status: " + ", ".join(
-            f"{name}={'OK' if value else 'MISSING'}"
-            for name, value in required.items()
+        required = {"MCORE_TOKEN": self.token, "MONGO_DB_NAME": self.mongo_db_name}
+        if not self.mongo_uri:
+            required.update({
+                "MONGO_USER": self.mongo_user,
+                "MONGO_PASSWORD": self.mongo_password,
+                "MONGO_HOST": self.mongo_host,
+            })
+        missing = [name for name, value in required.items() if not value]
+        logger.info(
+            "ENV status: " + ", ".join(
+                f"{name}={'OK' if value else 'MISSING'}" for name, value in required.items()
+            )
         )
-    )
-    if missing:
-        visible_names = sorted(
-            name for name in os.environ
-            if any(part in name.upper() for part in ("MCORE", "MONGO", "TOKEN", "PASSWORD"))
-        )
-        logger.critical(
-            "Не заданы обязательные ENV: %s. "
-            "Проверь точное написание Name в панели Botkeep. "
-            "Похожие имена, обнаруженные в окружении: %s",
-            ", ".join(missing),
-            ", ".join(visible_names) if visible_names else "(нет)"
-        )
-        raise SystemExit(1)
-    if not GROQ_API_KEY:
-        logger.warning(
-            "GROQ_API_KEY не задан - AI-режимы будут недоступны, "
-            "бот будет работать только локально"
+        if missing:
+            visible_names = sorted(
+                name for name in os.environ
+                if any(part in name.upper() for part in ("MCORE", "MONGO", "TOKEN", "PASSWORD"))
+            )
+            logger.critical(
+                "Не заданы обязательные ENV: %s. "
+                "Проверь точное написание Name в панели Botkeep. "
+                "Похожие имена, обнаруженные в окружении: %s",
+                ", ".join(missing),
+                ", ".join(visible_names) if visible_names else "(нет)"
+            )
+            raise SystemExit(1)
+        if not self.groq_api_key:
+            logger.warning(
+                "GROQ_API_KEY не задан - AI-режимы будут недоступны, "
+                "бот будет работать только локально"
+            )
+
+    def build_mongo_uri(self) -> str:
+        if self.mongo_uri:
+            return self.mongo_uri
+        username = urllib.parse.quote_plus(self.mongo_user)
+        password = urllib.parse.quote_plus(self.mongo_password)
+        return (
+            f"mongodb+srv://{username}:{password}"
+            f"@{self.mongo_host}/?appName={urllib.parse.quote_plus(self.mongo_app_name)}"
         )
 
 
-def build_mongo_uri() -> str:
-    username = urllib.parse.quote_plus(MONGO_USER)
-    password = urllib.parse.quote_plus(MONGO_PASSWORD)
-    return (
-        f"mongodb+srv://{username}:{password}"
-        f"@cluster0.u62aem5.mongodb.net/?appName=MCore"
-    )
+cfg = Config()
 
 
 # =========================================================================
@@ -200,7 +210,7 @@ def health():
 
 
 def run_flask():
-    serve(web_app, host='0.0.0.0', port=PORT, threads=4)
+    serve(web_app, host='0.0.0.0', port=cfg.port, threads=4)
 
 
 # =========================================================================
@@ -213,7 +223,8 @@ class SettingsManager:
         "chat_chance": 0.30,
         "allowed_channels": [],
         "mode": "local",
-        "custom_prompt": ""
+        "custom_prompt": "",
+        "vibe_enabled": True
     }
     VALID_MODES = {"local", "buddy", "aggressive", "friendly", "wise", "custom"}
 
@@ -223,28 +234,51 @@ class SettingsManager:
         self.cache_times: Dict[int, float] = {}
         self.ttl = 300
 
+    @classmethod
+    def defaults(cls) -> Dict:
+        data = dict(cls.DEFAULT)
+        data["allowed_channels"] = list(cls.DEFAULT["allowed_channels"])
+        return data
+
+    @classmethod
+    def _validate(cls, settings: Dict) -> Dict:
+        default = cls.DEFAULT
+        if settings.get("mode") not in cls.VALID_MODES:
+            settings["mode"] = default["mode"]
+        chance = settings.get("chat_chance")
+        if isinstance(chance, bool) or not isinstance(chance, (int, float)):
+            chance = default["chat_chance"]
+        settings["chat_chance"] = max(0.0, min(1.0, float(chance)))
+        for key in ("ai_chat", "ai_cmds", "vibe_enabled"):
+            if not isinstance(settings.get(key), bool):
+                settings[key] = default[key]
+        channels = settings.get("allowed_channels")
+        if not isinstance(channels, list):
+            channels = []
+        settings["allowed_channels"] = [c for c in channels if isinstance(c, int)]
+        if not isinstance(settings.get("custom_prompt"), str):
+            settings["custom_prompt"] = default["custom_prompt"]
+        return settings
+
     async def get(self, guild_id: int) -> Dict:
         now = time.time()
         if guild_id in self.cache and (now - self.cache_times.get(guild_id, 0)) < self.ttl:
             return self.cache[guild_id]
         try:
             doc = await self.db.find_one({"_id": f"server_{guild_id}"})
+            settings = self.defaults()
             if doc:
-                settings = {**self.DEFAULT, **doc}
-                settings.pop('_id', None)
-                if settings.get("mode") not in self.VALID_MODES:
-                    settings["mode"] = "local"
-                if not isinstance(settings.get("chat_chance"), (int, float)):
-                    settings["chat_chance"] = self.DEFAULT["chat_chance"]
-                settings["chat_chance"] = max(0.0, min(1.0, settings["chat_chance"]))
-            else:
-                settings = self.DEFAULT.copy()
+                doc.pop('_id', None)
+                settings.update(doc)
+            self._validate(settings)
             self.cache[guild_id] = settings
             self.cache_times[guild_id] = now
             return settings
         except Exception as e:
             logger.error(f"Ошибка загрузки настроек сервера {guild_id}: {e}")
-            return self.DEFAULT.copy()
+            if guild_id in self.cache:
+                return self.cache[guild_id]
+            return self.defaults()
 
     async def save(self, guild_id: int) -> bool:
         if guild_id not in self.cache:
@@ -255,7 +289,7 @@ class SettingsManager:
                 {"$set": self.cache[guild_id]},
                 upsert=True
             )
-            self.cache_times[guild_id] = 0
+            self.cache_times[guild_id] = time.time()
             return True
         except Exception as e:
             logger.error(f"Ошибка сохранения настроек сервера {guild_id}: {e}")
@@ -299,12 +333,12 @@ class MarkovBrain:
         for g in expired:
             if g in self.brains:
                 await self._save(g)
-                del self.brains[g]
+                self.brains.pop(g, None)
             self._brain_last_used.pop(g, None)
-        if len(self.brains) >= MAX_CACHED_BRAINS and gid not in self.brains:
+        if len(self.brains) >= MAX_CACHED_BRAINS and gid not in self.brains and self._brain_last_used:
             oldest = min(self._brain_last_used, key=self._brain_last_used.get)
             await self._save(oldest)
-            del self.brains[oldest]
+            self.brains.pop(oldest, None)
             self._brain_last_used.pop(oldest, None)
             logger.info(f"Мозг сервера {oldest} выгружен (LRU)")
         if gid in self.brains:
@@ -315,15 +349,14 @@ class MarkovBrain:
             if gid in self.brains:
                 self._brain_last_used[gid] = now
                 return self.brains[gid]
+            brain = self._new_brain()
             try:
                 doc = await self.db.find_one({"_id": f"brain_{gid}"})
             except Exception as e:
                 logger.error(f"Ошибка загрузки мозга {gid}: {e}")
-                brain = self._new_brain()
                 self.brains[gid] = brain
                 self._brain_last_used[gid] = now
                 return brain
-            brain = self._new_brain()
             if doc:
                 brain['word_pairs'] = defaultdict(
                     list, {k: list(v)[:MAX_CONTINUATIONS] for k, v in doc.get('word_pairs', {}).items()}
@@ -414,21 +447,18 @@ class MarkovBrain:
             valid_histories = [m for m in brain['message_history'] if m.get('tokens')]
             if valid_histories:
                 current_word = random.choice(valid_histories)['tokens'][0]
-        if not current_word and brain['all_words']:
-            current_word = random.choice(list(brain['all_words']))
         if not current_word:
-            return "Мне нечего сказать..."
+            current_word = random.choice(list(brain['all_words']))
         result = [current_word]
         for _ in range(length - 1):
             next_word = None
             if len(result) >= 2:
                 key = f"{result[-2]} {result[-1]}"
-                if key in brain['word_triplets'] and random.random() < 0.7:
-                    triplet_choices = brain['word_triplets'][key]
-                    if triplet_choices:
-                        next_word = random.choice(triplet_choices)
-            if not next_word and current_word in brain['word_pairs']:
-                pair_choices = brain['word_pairs'][current_word]
+                triplet_choices = brain['word_triplets'].get(key)
+                if triplet_choices and random.random() < 0.7:
+                    next_word = random.choice(triplet_choices)
+            if not next_word:
+                pair_choices = brain['word_pairs'].get(current_word)
                 if pair_choices:
                     next_word = random.choice(pair_choices)
             if not next_word:
@@ -458,7 +488,7 @@ class MarkovBrain:
 
     async def clear(self, gid: int):
         self.brains[gid] = self._new_brain()
-        self._brain_last_used.pop(gid, None)
+        self._brain_last_used[gid] = time.time()
         try:
             await self.db.delete_one({"_id": f"brain_{gid}"})
         except Exception as e:
@@ -475,14 +505,16 @@ class MarkovBrain:
 # =========================================================================
 class AIHandler:
     def __init__(self):
-        self.available = bool(GROQ_API_KEY)
+        self.available = bool(cfg.groq_api_key)
         if self.available:
-            logger.info(f"AI Handler инициализирован (Groq, модель {MODEL_NAME})")
+            logger.info(f"AI Handler инициализирован (Groq, модель {cfg.groq_model})")
         else:
             logger.warning("GROQ_API_KEY не задан - AI Handler недоступен")
-        self.contexts: Dict[int, deque] = defaultdict(lambda: deque(maxlen=AI_CONTEXT_MAXLEN))
+        self.contexts: Dict[int, deque] = {}
         self._context_last_used: Dict[int, float] = {}
-        self._rate_limits: Dict[tuple, deque] = defaultdict(lambda: deque(maxlen=AI_RATE_LIMIT_MAX_REQUESTS * 2))
+        self._rate_limits: Dict[tuple, deque] = defaultdict(
+            lambda: deque(maxlen=AI_RATE_LIMIT_MAX_REQUESTS * 2)
+        )
         self._rate_lock = asyncio.Lock()
 
     def _check_rate_limit(self, guild_id: int, user_id: int) -> bool:
@@ -504,6 +536,13 @@ class AIHandler:
             for ch in dead:
                 self.contexts.pop(ch, None)
                 self._context_last_used.pop(ch, None)
+            async with self._rate_lock:
+                stale = [
+                    k for k, q in self._rate_limits.items()
+                    if not q or now - q[-1] > AI_RATE_LIMIT_WINDOW
+                ]
+                for k in stale:
+                    del self._rate_limits[k]
             if dead:
                 logger.info(f"Очищено {len(dead)} неактивных AI-контекстов")
 
@@ -543,16 +582,16 @@ class AIHandler:
         messages = [
             {"role": "system", "content": f"{context_desc}\nОтвечай коротко, не более 1900 символов."}
         ]
-        for role, text in self.contexts[channel_id]:
+        for role, text in self.contexts.get(channel_id, ()):
             messages.append({"role": role, "content": text})
         messages.append({"role": "user", "content": prompt})
         try:
             headers = {
-                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Authorization": f"Bearer {cfg.groq_api_key}",
                 "Content-Type": "application/json"
             }
             payload = {
-                "model": MODEL_NAME,
+                "model": cfg.groq_model,
                 "messages": messages,
                 "max_tokens": 1000,
                 "temperature": 0.7
@@ -575,8 +614,9 @@ class AIHandler:
             choices = data.get("choices") or []
             answer = (choices[0].get("message", {}).get("content") or "").strip() if choices else ""
             if answer:
-                self.contexts[channel_id].append(("user", prompt[:200]))
-                self.contexts[channel_id].append(("assistant", answer[:200]))
+                ctx = self.contexts.setdefault(channel_id, deque(maxlen=AI_CONTEXT_MAXLEN))
+                ctx.append(("user", prompt[:200]))
+                ctx.append(("assistant", answer[:200]))
                 self._context_last_used[channel_id] = time.time()
                 return answer
             return None
@@ -649,7 +689,23 @@ async def _cleanup_host_cache_if_needed():
             logger.debug(f"Очищено {len(expired)} записей кэша хостов")
 
 
-async def _is_safe_host_async(hostname: str) -> bool:
+def _resolve_is_safe(hostname: str) -> bool:
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
+    except Exception:
+        return False
+    for info in addr_info:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split('%')[0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+async def _is_safe_host_async(hostname: Optional[str]) -> bool:
     if not hostname:
         return False
     hostname_lower = hostname.lower()
@@ -657,24 +713,11 @@ async def _is_safe_host_async(hostname: str) -> bool:
         return False
     now = time.time()
     async with _host_cache_lock:
-        if hostname_lower in _host_safety_cache:
-            cached_result, cached_time = _host_safety_cache[hostname_lower]
-            if now - cached_time < HOST_CACHE_TTL:
-                return cached_result
+        cached = _host_safety_cache.get(hostname_lower)
+        if cached and now - cached[1] < HOST_CACHE_TTL:
+            return cached[0]
     loop = asyncio.get_running_loop()
-
-    def _check():
-        try:
-            addr_info = socket.getaddrinfo(hostname, None)
-        except socket.gaierror:
-            return False
-        for info in addr_info:
-            ip = ipaddress.ip_address(info[4][0])
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False
-        return True
-
-    is_safe = await loop.run_in_executor(None, _check)
+    is_safe = await loop.run_in_executor(None, _resolve_is_safe, hostname)
     async with _host_cache_lock:
         _host_safety_cache[hostname_lower] = (is_safe, now)
     await _cleanup_host_cache_if_needed()
@@ -683,7 +726,7 @@ async def _is_safe_host_async(hostname: str) -> bool:
 
 async def parse_link(url: str) -> Optional[str]:
     try:
-        parsed = urlparse(url)
+        parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return None
         if not await _is_safe_host_async(parsed.hostname):
@@ -693,30 +736,33 @@ async def parse_link(url: str) -> Optional[str]:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         async with aiohttp.ClientSession(headers=headers) as session:
+            # Редиректы отключены, чтобы нельзя было обойти проверку хоста (SSRF)
             async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=LINK_REQUEST_TIMEOUT)
+                url,
+                timeout=aiohttp.ClientTimeout(total=LINK_REQUEST_TIMEOUT),
+                allow_redirects=False
             ) as resp:
                 if resp.status != 200:
                     return None
                 content_length = resp.headers.get('Content-Length')
-                if content_length and int(content_length) > MAX_BODY_BYTES:
+                if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
                     return None
                 raw = bytearray()
                 async for chunk in resp.content.iter_chunked(8192):
                     raw.extend(chunk)
                     if len(raw) > MAX_BODY_BYTES:
                         break
-                html = bytes(raw).decode(errors="ignore")
-                soup = BeautifulSoup(html, 'html.parser')
-                title = soup.title.string.strip() if soup.title and soup.title.string else ""
-                meta_desc = (
-                    soup.find('meta', attrs={'name': 'description'}) or
-                    soup.find('meta', attrs={'property': 'og:description'})
-                )
-                description = meta_desc.get('content', '').strip() if meta_desc else ""
-                if title or description:
-                    return f"Название: {title}. Описание: {description}"
-                return None
+        html = bytes(raw).decode(errors="ignore")
+        soup = BeautifulSoup(html, 'html.parser')
+        title = soup.title.string.strip() if soup.title and soup.title.string else ""
+        meta_desc = (
+            soup.find('meta', attrs={'name': 'description'}) or
+            soup.find('meta', attrs={'property': 'og:description'})
+        )
+        description = meta_desc.get('content', '').strip() if meta_desc else ""
+        if title or description:
+            return f"Название: {title}. Описание: {description}"
+        return None
     except Exception as e:
         logger.debug(f"Не удалось распарсить ссылку {url}: {e}")
         return None
@@ -773,9 +819,9 @@ class AdminView(discord.ui.View):
 
 
 class PromptModal(discord.ui.Modal):
-    def __init__(self, parent: "SettingsView", current: str):
+    def __init__(self, panel: "SettingsView", current: str):
         super().__init__(title="Кастомный промпт")
-        self.parent = parent
+        self.panel = panel
         self.prompt_input = discord.ui.TextInput(
             label="Промпт личности",
             style=discord.TextStyle.paragraph,
@@ -787,9 +833,9 @@ class PromptModal(discord.ui.Modal):
         self.add_item(self.prompt_input)
 
     async def on_submit(self, interaction: discord.Interaction):
-        gid = self.parent.guild.id
+        gid = self.panel.guild.id
         new_prompt = str(self.prompt_input.value or "").strip()
-        settings = await self.parent.bot.settings.get(gid)
+        settings = await self.panel.bot.settings.get(gid)
         settings["custom_prompt"] = new_prompt
         notice = "Кастомный промпт сохранен. Выбери режим «Пользовательский», чтобы его использовать."
         if not new_prompt:
@@ -797,7 +843,7 @@ class PromptModal(discord.ui.Modal):
             if settings.get("mode") == "custom":
                 settings["mode"] = "local"
                 notice += " Режим переключен на «Локальный»."
-        await self.parent._save_and_refresh(interaction, settings, notice)
+        await self.panel._save_and_refresh(interaction, settings, notice)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception):
         logger.error(f"Ошибка в PromptModal: {type(error).__name__}: {error}")
@@ -806,12 +852,12 @@ class PromptModal(discord.ui.Modal):
 
 
 class ChannelsView(AdminView):
-    def __init__(self, parent: "SettingsView", current_ids: list):
+    def __init__(self, panel: "SettingsView", current_ids: list):
         super().__init__(timeout=120)
-        self.parent = parent
+        self.panel = panel
         defaults = []
         for cid in current_ids:
-            ch = parent.guild.get_channel(cid)
+            ch = panel.guild.get_channel(cid)
             if isinstance(ch, discord.TextChannel):
                 defaults.append(ch)
         defaults = defaults[:25]
@@ -826,11 +872,11 @@ class ChannelsView(AdminView):
         self.add_item(self.channel_select)
 
     async def _on_select(self, interaction: discord.Interaction):
-        gid = self.parent.guild.id
+        gid = self.panel.guild.id
         ids = [c.id for c in self.channel_select.values]
-        settings = await self.parent.bot.settings.get(gid)
+        settings = await self.panel.bot.settings.get(gid)
         settings["allowed_channels"] = ids
-        ok = await self.parent.bot.settings.save(gid)
+        ok = await self.panel.bot.settings.save(gid)
         if not ok:
             text = "Не удалось сохранить настройки, попробуй ещё раз."
         elif ids:
@@ -839,7 +885,7 @@ class ChannelsView(AdminView):
             text = "Ограничений нет - бот отвечает во всех каналах."
         await interaction.response.edit_message(content=text, view=None)
         self.stop()
-        await self.parent.update_origin(settings)
+        await self.panel.update_origin(settings)
 
 
 class SettingsView(AdminView):
@@ -863,6 +909,9 @@ class SettingsView(AdminView):
         pct = round(settings.get("chat_chance", 0.3) * 100)
         self.chance_down.disabled = pct <= 0
         self.chance_up.disabled = pct >= 100
+        vibe = settings.get("vibe_enabled", True)
+        self.vibe_button.label = f"Вайб: {'ВКЛ' if vibe else 'ВЫКЛ'}"
+        self.vibe_button.style = discord.ButtonStyle.success if vibe else discord.ButtonStyle.danger
         self.clear_button.label = "Точно очистить?" if self._clear_armed else "Очистить память"
         self.clear_button.style = discord.ButtonStyle.danger
 
@@ -884,6 +933,11 @@ class SettingsView(AdminView):
             inline=True
         )
         embed.add_field(name="Шанс ответа", value=f"{pct}%", inline=True)
+        embed.add_field(
+            name="Вайб",
+            value="Включен" if settings.get("vibe_enabled", True) else "Выключен",
+            inline=True
+        )
         embed.add_field(name="Каналы", value=channels_text[:1024], inline=False)
         if prompt:
             preview = prompt[:300].replace("```", "'''")
@@ -934,6 +988,7 @@ class SettingsView(AdminView):
             except discord.HTTPException:
                 pass
 
+    # ---- Ряд 0: выбор режима ----
     @discord.ui.select(
         placeholder="Режим личности",
         options=[discord.SelectOption(label=n, value=k) for k, n in MODE_NAMES.items()],
@@ -952,6 +1007,7 @@ class SettingsView(AdminView):
         settings["mode"] = mode
         await self._save_and_refresh(interaction, settings)
 
+    # ---- Ряд 1: авто-флуд и шанс ----
     @discord.ui.button(label="Авто-флуд", style=discord.ButtonStyle.secondary, row=1)
     async def toggle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         settings = await self.bot.settings.get(self.guild.id)
@@ -973,7 +1029,15 @@ class SettingsView(AdminView):
     async def chance_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._change_chance(interaction, CHANCE_STEP)
 
-    @discord.ui.button(label="Каналы", style=discord.ButtonStyle.primary, row=2)
+    # ---- Ряд 2: вайб ----
+    @discord.ui.button(label="Вайб", style=discord.ButtonStyle.success, row=2)
+    async def vibe_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await self.bot.settings.get(self.guild.id)
+        settings["vibe_enabled"] = not settings.get("vibe_enabled", True)
+        await self._save_and_refresh(interaction, settings)
+
+    # ---- Ряд 3: каналы, промпт, очистка ----
+    @discord.ui.button(label="Каналы", style=discord.ButtonStyle.primary, row=3)
     async def channels_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         settings = await self.bot.settings.get(self.guild.id)
         view = ChannelsView(self, settings.get("allowed_channels", []))
@@ -984,12 +1048,12 @@ class SettingsView(AdminView):
             ephemeral=True
         )
 
-    @discord.ui.button(label="Промпт", style=discord.ButtonStyle.primary, row=2)
+    @discord.ui.button(label="Промпт", style=discord.ButtonStyle.primary, row=3)
     async def prompt_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         settings = await self.bot.settings.get(self.guild.id)
         await interaction.response.send_modal(PromptModal(self, settings.get("custom_prompt", "")))
 
-    @discord.ui.button(label="Очистить память", style=discord.ButtonStyle.danger, row=2)
+    @discord.ui.button(label="Очистить память", style=discord.ButtonStyle.danger, row=3)
     async def clear_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         settings = await self.bot.settings.get(self.guild.id)
         if not self._clear_armed:
@@ -1010,9 +1074,8 @@ class MCoreBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True
         super().__init__(
-            command_prefix='/',
+            command_prefix=commands.when_mentioned,
             intents=intents,
             help_command=None,
             status=discord.Status.online,
@@ -1023,12 +1086,12 @@ class MCoreBot(commands.Bot):
         self.brain: Optional[MarkovBrain] = None
         self.ai: Optional[AIHandler] = None
         self.vibe: Optional[VibeAnalyzer] = None
-        self._keep_alive_task = None
+        self._bg_tasks: list = []
 
     async def setup_hook(self):
         try:
             self.mongo_client = AsyncIOMotorClient(
-                build_mongo_uri(),
+                cfg.build_mongo_uri(),
                 serverSelectionTimeoutMS=10000,
                 maxPoolSize=10,
                 minPoolSize=2
@@ -1036,17 +1099,18 @@ class MCoreBot(commands.Bot):
             await self.mongo_client.admin.command('ping')
             logger.info("MongoDB подключена")
         except Exception as e:
-            logger.critical(f"Ошибка MongoDB: {e}")
-            while True:
-                await asyncio.sleep(60)
-        db = self.mongo_client[MONGO_DB_NAME]
+            logger.critical(f"Ошибка подключения к MongoDB: {type(e).__name__}: {e}")
+            raise
+        db = self.mongo_client[cfg.mongo_db_name]
         self.settings = SettingsManager(db["settings"])
         self.brain = MarkovBrain(db["brain"])
         self.ai = AIHandler()
         self.vibe = VibeAnalyzer()
-        self._keep_alive_task = asyncio.create_task(self._keep_alive_loop())
-        asyncio.create_task(self.ai._cleanup_contexts())
-        asyncio.create_task(self.vibe._cleanup_loop())
+        self._bg_tasks = [
+            asyncio.create_task(self._keep_alive_loop()),
+            asyncio.create_task(self.ai._cleanup_contexts()),
+            asyncio.create_task(self.vibe._cleanup_loop()),
+        ]
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -1090,18 +1154,26 @@ class MCoreBot(commands.Bot):
         while True:
             try:
                 async with aiohttp.ClientSession() as s:
-                    async with s.get(f"http://localhost:{PORT}/health", timeout=aiohttp.ClientTimeout(total=5)):
+                    async with s.get(
+                        f"http://localhost:{cfg.port}/health",
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ):
                         pass
             except Exception:
                 pass
             await asyncio.sleep(60)
 
     def _register_commands(self):
-        bot_group = app_commands.Group(name="bot", description="Управление ботом")
+        bot_group = app_commands.Group(name="bot", description="Управление ботом", guild_only=True)
 
         @bot_group.command(name="clear", description="Очистить память бота")
         @app_commands.default_permissions(administrator=True)
         async def bot_clear(interaction: discord.Interaction):
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message(
+                    "Эта команда доступна только администраторам.", ephemeral=True
+                )
+                return
             await self.brain.clear(interaction.guild.id)
             await interaction.response.send_message("Память очищена!", ephemeral=True)
 
@@ -1117,7 +1189,7 @@ class MCoreBot(commands.Bot):
                 return
             emb = discord.Embed(
                 title="Текущий кастомный промпт",
-                description=f"```\n{prompt[:4000]}\n```",
+                description=f"```\n{prompt[:4000].replace('```', chr(39) * 3)}\n```",
                 color=0x00BFFF,
                 timestamp=discord.utils.utcnow()
             )
@@ -1187,6 +1259,7 @@ class MCoreBot(commands.Bot):
                 value=(
                     f"Авто-флуд: `{'вкл' if settings['ai_chat'] else 'выкл'}`\n"
                     f"Шанс ответа: `{int(round(settings['chat_chance'] * 100))}%`\n"
+                    f"Вайб: `{'вкл' if settings['vibe_enabled'] else 'выкл'}`\n"
                     f"Каналы: {channels_text}\n"
                     f"Режим: `{MODE_NAMES.get(settings['mode'], settings['mode'])}`"
                 ),
@@ -1197,7 +1270,7 @@ class MCoreBot(commands.Bot):
             embed.set_footer(text=f"MCore | {BOT_VERSION}")
             await interaction.followup.send(embed=embed)
 
-        gen_group = app_commands.Group(name="generate", description="Генерация контента")
+        gen_group = app_commands.Group(name="generate", description="Генерация контента", guild_only=True)
 
         async def _generate_and_reply(interaction, ai_prompt, fallback_fn, embed_title):
             await interaction.response.defer()
@@ -1206,7 +1279,7 @@ class MCoreBot(commands.Bot):
             custom_prompt = settings.get("custom_prompt", "")
             result = None
             async with safe_typing(interaction.channel):
-                if self.ai.is_mode_usable(mode, custom_prompt) and mode != "local":
+                if mode != "local" and self.ai.is_mode_usable(mode, custom_prompt):
                     result = await self.ai.generate(
                         interaction.channel_id, ai_prompt, mode, custom_prompt,
                         guild_id=interaction.guild.id,
@@ -1256,6 +1329,7 @@ class MCoreBot(commands.Bot):
         self.tree.add_command(gen_group)
 
         @self.tree.command(name="topwords", description="Топ слов в лексиконе")
+        @app_commands.guild_only()
         async def top_words(interaction: discord.Interaction):
             stats = await self.brain.get_stats(interaction.guild.id)
             if not stats['top_words']:
@@ -1278,66 +1352,68 @@ class MCoreBot(commands.Bot):
             await self.brain.learn(message, gid)
         except Exception as e:
             logger.error(f"Ошибка обучения мозга на сообщении {message.id}: {e}")
+
         settings = await self.settings.get(gid)
         base_mode = settings.get("mode", "local")
         custom_prompt = settings.get("custom_prompt", "")
         allowed_channels = settings.get("allowed_channels", [])
-        is_allowed = not allowed_channels or message.channel.id in allowed_channels
-        if not is_allowed:
-            await self.process_commands(message)
+        if allowed_channels and message.channel.id not in allowed_channels:
             return
-        dynamic_mode = self.vibe.analyze(message)
+
+        # Вайб влияет на режим и шанс только если включен в /settings
+        dynamic_mode = self.vibe.analyze(message) if settings.get("vibe_enabled", True) else None
         current_mode = dynamic_mode if dynamic_mode else base_mode
         actual_chance = settings["chat_chance"] * 2 if dynamic_mode else settings["chat_chance"]
         clean = re.sub(r'<@!?\d+>', '', message.content).strip()
+
         should_reply = False
-        if message.reference and message.reference.resolved:
-            if isinstance(message.reference.resolved, discord.Message) and \
-               message.reference.resolved.author == self.user:
-                should_reply = True
-        if self.user.mentioned_in(message):
+        ref = message.reference.resolved if message.reference else None
+        if isinstance(ref, discord.Message) and ref.author == self.user:
+            should_reply = True
+        if self.user in message.mentions:
             should_reply = True
         if settings["ai_chat"] and random.random() < actual_chance:
             should_reply = True
         if not should_reply:
-            await self.process_commands(message)
             return
-        async with safe_typing(message.channel):
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-            response = None
-            if self.ai.is_mode_usable(current_mode, custom_prompt) and current_mode != "local" and clean:
-                urls = re.findall(r'(https?://\S+)', message.content)
-                if urls:
-                    link_info = await parse_link(urls[0])
-                    if link_info:
-                        clean = f"Пользователь скинул ссылку. {link_info}. Прокомментируй это. Сообщение: {clean}"
-                response = await self.ai.generate(
-                    message.channel.id, clean, current_mode, custom_prompt,
-                    guild_id=gid,
-                    user_id=message.author.id
-                )
-            if not response:
-                brain_stats = await self.brain.get_stats(gid)
-                if brain_stats['total_messages'] > 10:
-                    response = await self.brain.generate_response(gid, message.content)
-                else:
-                    response = "Мне пока нечего сказать, нужно больше сообщений для обучения!"
-            if response:
-                try:
+
+        try:
+            async with safe_typing(message.channel):
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                response = None
+                if current_mode != "local" and clean and self.ai.is_mode_usable(current_mode, custom_prompt):
+                    urls = re.findall(r'(https?://\S+)', message.content)
+                    if urls:
+                        link_info = await parse_link(urls[0])
+                        if link_info:
+                            clean = f"Пользователь скинул ссылку. {link_info}. Прокомментируй это. Сообщение: {clean}"
+                    response = await self.ai.generate(
+                        message.channel.id, clean, current_mode, custom_prompt,
+                        guild_id=gid,
+                        user_id=message.author.id
+                    )
+                if not response:
+                    brain_stats = await self.brain.get_stats(gid)
+                    if brain_stats['total_messages'] > 10:
+                        response = await self.brain.generate_response(gid, message.content)
+                    else:
+                        response = "Мне пока нечего сказать, нужно больше сообщений для обучения!"
+                if response:
                     await message.channel.send(
                         response[:1990],
                         reference=message,
                         mention_author=False,
                         allowed_mentions=discord.AllowedMentions.none()
                     )
-                except discord.HTTPException as e:
-                    logger.error(f"Ошибка отправки ответа: {e}")
-        await self.process_commands(message)
+        except discord.HTTPException as e:
+            logger.error(f"Ошибка отправки ответа: {e}")
+        except Exception as e:
+            logger.error(f"Ошибка обработки сообщения {message.id}: {type(e).__name__}: {e}")
 
     async def close(self):
         logger.info("Завершение работы...")
-        if self._keep_alive_task:
-            self._keep_alive_task.cancel()
+        for task in self._bg_tasks:
+            task.cancel()
         if self.brain:
             await self.brain.save_all()
         if self.mongo_client:
@@ -1351,13 +1427,13 @@ class MCoreBot(commands.Bot):
 # =========================================================================
 def main():
     load_env_file()
-    validate_config()
+    cfg.load()
     flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info("Веб-сервер запущен")
     bot = MCoreBot()
     try:
-        bot.run(MCORE_TOKEN)
+        bot.run(cfg.token)
     except discord.LoginFailure:
         logger.critical("Неверный токен Discord!")
     except Exception as e:
