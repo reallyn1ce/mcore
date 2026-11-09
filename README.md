@@ -23,7 +23,7 @@ pip install -r requirements.txt
 Заполни переменные окружения (см. ниже) и запусти:
 
 ```bash
-python main.py
+python bot.py
 ```
 
 На хостинге (например, Botkeep) добавь переменные в панели — бот также читает файл `.env`.
@@ -33,10 +33,10 @@ python main.py
 | Переменная | Обязательна | Описание |
 |---|---|---|
 | `MCORE_TOKEN` | да | Токен Discord-бота |
-| `MONGO_DB_NAME` | да | Имя базы данных MongoDB |
+| `MONGO_DB_NAME` | нет | Имя базы данных MongoDB (по умолчанию `smmunity_database`) |
 | `MONGO_USER` | да* | Пользователь MongoDB |
 | `MONGO_PASSWORD` | да* | Пароль MongoDB (спецсимволы экранируются автоматически) |
-| `MONGO_HOST` | да* | Хост кластера, например `cluster0.xxxxx.mongodb.net` |
+| `MONGO_HOST` | нет | Хост кластера (по умолчанию `cluster0.u62aem5.mongodb.net`) |
 | `MONGO_URI` | нет | Готовая строка подключения. Если задана — `MONGO_USER/PASSWORD/HOST` не нужны |
 | `MONGO_APP_NAME` | нет | `appName` в строке подключения (по умолчанию `MCore`) |
 | `GROQ_API_KEY` | нет | Ключ Groq. Без него работает только локальный режим |

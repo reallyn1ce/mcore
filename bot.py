@@ -31,6 +31,9 @@ from discord import app_commands
 # =========================================================================
 BOT_VERSION = "2.2.0"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+# Значения из старой версии (mcore_bot_botkeep_fixed.py) - используются, если ENV не заданы
+DEFAULT_MONGO_HOST = "cluster0.u62aem5.mongodb.net"
+DEFAULT_MONGO_DB_NAME = "smmunity_database"
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 AI_RATE_LIMIT_WINDOW = 60
 AI_RATE_LIMIT_MAX_REQUESTS = 5
@@ -124,9 +127,9 @@ class Config:
         self.mongo_uri = ""
         self.mongo_user = ""
         self.mongo_password = ""
-        self.mongo_host = ""
+        self.mongo_host = DEFAULT_MONGO_HOST
         self.mongo_app_name = "MCore"
-        self.mongo_db_name = ""
+        self.mongo_db_name = DEFAULT_MONGO_DB_NAME
         self.port = 10000
 
     def load(self):
@@ -136,9 +139,9 @@ class Config:
         self.mongo_uri = _env("MONGO_URI")
         self.mongo_user = _env("MONGO_USER")
         self.mongo_password = _env("MONGO_PASSWORD")
-        self.mongo_host = _env("MONGO_HOST")
+        self.mongo_host = _env("MONGO_HOST", DEFAULT_MONGO_HOST)
         self.mongo_app_name = _env("MONGO_APP_NAME", "MCore")
-        self.mongo_db_name = _env("MONGO_DB_NAME")
+        self.mongo_db_name = _env("MONGO_DB_NAME", DEFAULT_MONGO_DB_NAME)
         try:
             self.port = int(_env("PORT", "10000"))
             if not 1 <= self.port <= 65535:
