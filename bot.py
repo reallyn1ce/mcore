@@ -1,5 +1,5 @@
 # ====================================================================
-# MCore - Version 2.2.0
+# MCore - Version 2.3.0
 # ====================================================================
 import os
 import re
@@ -15,7 +15,7 @@ import signal
 from contextlib import asynccontextmanager
 from threading import Thread
 from collections import defaultdict, deque, Counter
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple, Any
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -29,7 +29,7 @@ from discord import app_commands
 # =========================================================================
 # КОНФИГУРАЦИЯ
 # =========================================================================
-BOT_VERSION = "2.2.0"
+BOT_VERSION = "2.3.0"
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 # Значения из старой версии (mcore_bot_botkeep_fixed.py) - используются, если ENV не заданы
 DEFAULT_MONGO_HOST = "cluster0.u62aem5.mongodb.net"
@@ -51,6 +51,16 @@ MAX_CUSTOM_PROMPT = 1500
 CHANCE_STEP = 10
 SETTINGS_PANEL_TIMEOUT = 600
 AI_TIMEOUT_SECONDS = 20
+VISION_TIMEOUT_SECONDS = 30
+VISION_MAX_IMAGE_BYTES = 20 * 1024 * 1024  # лимит Groq для изображения по URL
+VISION_ALLOWED_TYPES = {"jpeg", "jpg", "png", "gif", "webp"}
+VISION_DEFAULT_PROMPT = "Что на этом изображении?"
+VISION_UNSUPPORTED_MESSAGE = "⚠️ Текущая модель не поддерживает изображения. Смените модель в настройках."
+# Признаки того, что проблема в самой картинке/ссылке (а не в модели) - тогда отвечаем как на обычный текст
+VISION_IMAGE_ERROR_MARKERS = (
+    "download", "fetch", "retriev", "404", "not found", "too large", "too big",
+    "invalid image", "invalid url", "image url", "image format", "timeout", "timed out",
+)
 MAX_BODY_BYTES = 1_000_000
 LINK_REQUEST_TIMEOUT = 5
 BLOCKED_HOSTS = {"localhost", "metadata.google.internal", "169.254.169.254"}
@@ -60,11 +70,42 @@ BRAIN_IDLE_TTL = 600
 AI_CONTEXT_MAXLEN = 12
 CLEANUP_INTERVAL = 3600
 
+# Общие правила для всех режимов (имя бота в промптах намеренно не упоминается)
+COMMON_RULES = (
+    "Ты бот в Discord-чате, а не ассистент: не представляйся, не называй своё имя и не говори, "
+    "что ты ИИ или языковая модель, пока об этом не спросили напрямую. "
+    "Пиши как живой участник чата: на языке собеседника (по умолчанию русский), "
+    "без markdown-заголовков и списков, без вступлений вроде «Конечно!» и «Отличный вопрос». "
+    "Говори о себе в мужском роде. Не используй @everyone и @here. "
+    "Отвечай коротко, не более 1900 символов."
+)
+
+VISION_HINT = (
+    "К сообщению приложена картинка. Посмотри на неё и ответь в своём стиле: "
+    "коротко скажи, что на ней, и/или отреагируй, учитывая текст пользователя."
+)
+
 PERSONALITIES = {
-    "buddy": "Ты - MCore. Общаешься с юмором, сарказмом, иногда матом. Говори о себе в мужском роде. Отвечай кратко. Вливайся в компанию. Используй локальные шутки/слова с чата. (1-3 предложения).",
-    "aggressive": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Отвечай агрессией на агрессию. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)",
-    "friendly": "Ты - MCore. Отвечай добротой на доброту. Говори о себе в мужском роде. Отвечай кратко. (1-3 предложения)",
-    "wise": "Ты - MCore. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. Говори о себе в мужском роде. Отвечай кратко (1-3 предложения)."
+    "buddy": (
+        "Ты - свой в доску парень в Discord-чате. Общаешься с юмором, сарказмом, иногда с матом. "
+        "Вливайся в компанию: подхватывай локальные шутки и словечки чата, подкалывай по-дружески, "
+        "но без настоящей злобы. Отвечай по делу и кратко (1-3 предложения)."
+    ),
+    "aggressive": (
+        "Ты - дерзкий бот в Discord-чате. ИСПОЛЬЗУЙ РУССКИЙ МАТ ДЛЯ СВЯЗКИ СЛОВ. "
+        "Отвечай агрессией на агрессию, огрызайся и язви. Если собеседник спокоен - будь просто резким "
+        "и ироничным. Не оскорбляй по национальности, религии, ориентации и здоровью. "
+        "Отвечай кратко (1-3 предложения)."
+    ),
+    "friendly": (
+        "Ты - добрый и поддерживающий бот в Discord-чате. Отвечай добротой на доброту: подбадривай, "
+        "хвали за хорошее, мягко шути. Без пафоса и нравоучений. Отвечай кратко (1-3 предложения)."
+    ),
+    "wise": (
+        "Ты - ироничный мудрец в Discord-чате: говоришь коротко и афористично, как бывалый старик "
+        "с жизненным опытом, можешь вставить русский мат для связки слов и притчу с подколом. "
+        "При этом даёшь реальный совет по сути вопроса. Отвечай кратко (1-3 предложения)."
+    ),
 }
 
 MODE_NAMES = {
@@ -227,7 +268,8 @@ class SettingsManager:
         "allowed_channels": [],
         "mode": "local",
         "custom_prompt": "",
-        "vibe_enabled": True
+        "vibe_enabled": True,
+        "vision_enabled": True
     }
     VALID_MODES = {"local", "buddy", "aggressive", "friendly", "wise", "custom"}
 
@@ -252,7 +294,7 @@ class SettingsManager:
         if isinstance(chance, bool) or not isinstance(chance, (int, float)):
             chance = default["chat_chance"]
         settings["chat_chance"] = max(0.0, min(1.0, float(chance)))
-        for key in ("ai_chat", "ai_cmds", "vibe_enabled"):
+        for key in ("ai_chat", "ai_cmds", "vibe_enabled", "vision_enabled"):
             if not isinstance(settings.get(key), bool):
                 settings[key] = default[key]
         channels = settings.get("allowed_channels")
@@ -558,6 +600,38 @@ class AIHandler:
             return False
         return True
 
+    async def _post_groq(self, payload: Dict, timeout: int) -> Tuple[int, Any]:
+        """Возвращает (status, json) при 200, иначе (status, текст ошибки)."""
+        headers = {
+            "Authorization": f"Bearer {cfg.groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                GROQ_URL,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout)
+            ) as resp:
+                if resp.status == 200:
+                    return 200, await resp.json()
+                return resp.status, (await resp.text())[:500]
+
+    @staticmethod
+    def _build_messages(system: str, history, prompt: str, image_url: Optional[str]) -> list:
+        messages = [{"role": "system", "content": system}]
+        for role, text in history:
+            messages.append({"role": role, "content": text})
+        if image_url:
+            user_content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": image_url}}
+            ]
+        else:
+            user_content = prompt
+        messages.append({"role": "user", "content": user_content})
+        return messages
+
     async def generate(
         self,
         channel_id: int,
@@ -565,7 +639,8 @@ class AIHandler:
         personality: str = "buddy",
         custom_prompt: str = "",
         guild_id: Optional[int] = None,
-        user_id: Optional[int] = None
+        user_id: Optional[int] = None,
+        image_url: Optional[str] = None
     ) -> Optional[str]:
         if not self.available or not prompt.strip():
             return None
@@ -581,50 +656,58 @@ class AIHandler:
                 return None
             context_desc = custom_prompt
         else:
-            context_desc = PERSONALITIES.get(personality, "Ты обычный бот-собеседник.")
-        messages = [
-            {"role": "system", "content": f"{context_desc}\nОтвечай коротко, не более 1900 символов."}
-        ]
-        for role, text in self.contexts.get(channel_id, ()):
-            messages.append({"role": role, "content": text})
-        messages.append({"role": "user", "content": prompt})
+            context_desc = PERSONALITIES.get(personality, "Ты обычный бот-собеседник в Discord.")
+        history = list(self.contexts.get(channel_id, ()))
+
+        def make_system(with_image: bool) -> str:
+            parts = [context_desc, COMMON_RULES]
+            if with_image:
+                parts.append(VISION_HINT)
+            return "\n".join(parts)
+
         try:
-            headers = {
-                "Authorization": f"Bearer {cfg.groq_api_key}",
-                "Content-Type": "application/json"
-            }
+            with_image = bool(image_url)
             payload = {
                 "model": cfg.groq_model,
-                "messages": messages,
+                "messages": self._build_messages(make_system(with_image), history, prompt, image_url),
                 "max_tokens": 1000,
                 "temperature": 0.7
             }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    GROQ_URL,
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=AI_TIMEOUT_SECONDS)
-                ) as resp:
-                    if resp.status == 429:
-                        logger.warning("Groq: превышен лимит запросов (429)")
-                        return None
-                    if resp.status != 200:
-                        body = (await resp.text())[:300]
-                        logger.error(f"Groq вернул {resp.status}: {body}")
-                        return None
-                    data = await resp.json()
+            timeout = VISION_TIMEOUT_SECONDS if with_image else AI_TIMEOUT_SECONDS
+            status, data = await self._post_groq(payload, timeout)
+
+            # Ошибка при отправке картинки: либо модель без Vision, либо битая ссылка
+            if with_image and status in (400, 413, 415, 422):
+                body = str(data).lower()
+                logger.warning(f"Groq отклонил запрос с изображением ({status}): {str(data)[:300]}")
+                if any(marker in body for marker in VISION_IMAGE_ERROR_MARKERS):
+                    # Проблема в картинке/ссылке - отвечаем как на обычный текст
+                    if prompt == VISION_DEFAULT_PROMPT:
+                        return None  # текста нет, отвечать не на что - пусть сработает fallback
+                    with_image = False
+                    payload["messages"] = self._build_messages(make_system(False), history, prompt, None)
+                    status, data = await self._post_groq(payload, AI_TIMEOUT_SECONDS)
+                else:
+                    return VISION_UNSUPPORTED_MESSAGE
+
+            if status == 429:
+                logger.warning("Groq: превышен лимит запросов (429)")
+                return None
+            if status != 200:
+                logger.error(f"Groq вернул {status}: {str(data)[:300]}")
+                return None
+
             choices = data.get("choices") or []
             answer = (choices[0].get("message", {}).get("content") or "").strip() if choices else ""
             if answer:
                 ctx = self.contexts.setdefault(channel_id, deque(maxlen=AI_CONTEXT_MAXLEN))
-                ctx.append(("user", prompt[:200]))
+                ctx.append(("user", (("[картинка] " if with_image else "") + prompt)[:200]))
                 ctx.append(("assistant", answer[:200]))
                 self._context_last_used[channel_id] = time.time()
                 return answer
             return None
         except asyncio.TimeoutError:
-            logger.error(f"AI генерация превысила {AI_TIMEOUT_SECONDS}с (канал {channel_id})")
+            logger.error(f"AI генерация превысила таймаут (канал {channel_id})")
             return None
         except Exception as e:
             logger.error(f"Ошибка AI генерации: {type(e).__name__}: {e}")
@@ -771,6 +854,21 @@ async def parse_link(url: str) -> Optional[str]:
         return None
 
 
+def pick_image_url(message: discord.Message) -> Optional[str]:
+    """Прямая ссылка на первую подходящую картинку из вложений (остальные игнорируются)."""
+    for att in message.attachments:
+        ctype = (att.content_type or "").lower()
+        if not ctype.startswith("image/"):
+            continue
+        subtype = ctype.split("/", 1)[1].split(";", 1)[0].strip()
+        if subtype not in VISION_ALLOWED_TYPES:
+            continue
+        if att.size and att.size > VISION_MAX_IMAGE_BYTES:
+            continue
+        return att.url
+    return None
+
+
 def iq_status(iq: int) -> str:
     if iq < 60:
         return "очень низкий"
@@ -915,6 +1013,9 @@ class SettingsView(AdminView):
         vibe = settings.get("vibe_enabled", True)
         self.vibe_button.label = f"Вайб: {'ВКЛ' if vibe else 'ВЫКЛ'}"
         self.vibe_button.style = discord.ButtonStyle.success if vibe else discord.ButtonStyle.danger
+        vision = settings.get("vision_enabled", True)
+        self.vision_button.label = f"👁️ Зрение: {'ВКЛ' if vision else 'ВЫКЛ'}"
+        self.vision_button.style = discord.ButtonStyle.success if vision else discord.ButtonStyle.danger
         self.clear_button.label = "Точно очистить?" if self._clear_armed else "Очистить память"
         self.clear_button.style = discord.ButtonStyle.danger
 
@@ -939,6 +1040,11 @@ class SettingsView(AdminView):
         embed.add_field(
             name="Вайб",
             value="Включен" if settings.get("vibe_enabled", True) else "Выключен",
+            inline=True
+        )
+        embed.add_field(
+            name="Зрение",
+            value="Включено" if settings.get("vision_enabled", True) else "Выключено",
             inline=True
         )
         embed.add_field(name="Каналы", value=channels_text[:1024], inline=False)
@@ -1037,6 +1143,12 @@ class SettingsView(AdminView):
     async def vibe_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         settings = await self.bot.settings.get(self.guild.id)
         settings["vibe_enabled"] = not settings.get("vibe_enabled", True)
+        await self._save_and_refresh(interaction, settings)
+
+    @discord.ui.button(label="👁️ Зрение", style=discord.ButtonStyle.success, row=2)
+    async def vision_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        settings = await self.bot.settings.get(self.guild.id)
+        settings["vision_enabled"] = not settings.get("vision_enabled", True)
         await self._save_and_refresh(interaction, settings)
 
     # ---- Ряд 3: каналы, промпт, очистка ----
@@ -1263,6 +1375,7 @@ class MCoreBot(commands.Bot):
                     f"Авто-флуд: `{'вкл' if settings['ai_chat'] else 'выкл'}`\n"
                     f"Шанс ответа: `{int(round(settings['chat_chance'] * 100))}%`\n"
                     f"Вайб: `{'вкл' if settings['vibe_enabled'] else 'выкл'}`\n"
+                    f"Зрение: `{'вкл' if settings.get('vision_enabled', True) else 'выкл'}`\n"
                     f"Каналы: {channels_text}\n"
                     f"Режим: `{MODE_NAMES.get(settings['mode'], settings['mode'])}`"
                 ),
@@ -1348,13 +1461,16 @@ class MCoreBot(commands.Bot):
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
             return
-        if message.attachments and not re.sub(r'<@!?\d+>', '', message.content).strip():
+        has_text = bool(re.sub(r'<@!?\d+>', '', message.content).strip())
+        image_only = bool(message.attachments) and not has_text
+        if image_only and not any((a.content_type or "").startswith("image/") for a in message.attachments):
             return
         gid = message.guild.id
-        try:
-            await self.brain.learn(message, gid)
-        except Exception as e:
-            logger.error(f"Ошибка обучения мозга на сообщении {message.id}: {e}")
+        if not image_only:  # сообщения только с картинкой мозг не учит (как и раньше)
+            try:
+                await self.brain.learn(message, gid)
+            except Exception as e:
+                logger.error(f"Ошибка обучения мозга на сообщении {message.id}: {e}")
 
         settings = await self.settings.get(gid)
         base_mode = settings.get("mode", "local")
@@ -1380,11 +1496,21 @@ class MCoreBot(commands.Bot):
         if not should_reply:
             return
 
+        # Vision: берём только первую картинку; если зрение выключено - картинки игнорируются
+        image_url = pick_image_url(message) if settings.get("vision_enabled", True) else None
+        can_use_ai = current_mode != "local" and self.ai.is_mode_usable(current_mode, custom_prompt)
+        if image_only and not (image_url and can_use_ai):
+            return
+        if image_url and not can_use_ai:
+            image_url = None
+        if image_url and not clean:
+            clean = VISION_DEFAULT_PROMPT
+
         try:
             async with safe_typing(message.channel):
                 await asyncio.sleep(random.uniform(1.0, 2.0))
                 response = None
-                if current_mode != "local" and clean and self.ai.is_mode_usable(current_mode, custom_prompt):
+                if can_use_ai and clean:
                     urls = re.findall(r'(https?://\S+)', message.content)
                     if urls:
                         link_info = await parse_link(urls[0])
@@ -1393,7 +1519,8 @@ class MCoreBot(commands.Bot):
                     response = await self.ai.generate(
                         message.channel.id, clean, current_mode, custom_prompt,
                         guild_id=gid,
-                        user_id=message.author.id
+                        user_id=message.author.id,
+                        image_url=image_url
                     )
                 if not response:
                     brain_stats = await self.brain.get_stats(gid)
